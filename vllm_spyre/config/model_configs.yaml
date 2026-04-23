@@ -35,7 +35,25 @@ _templates:
       FLEX_HDMA_P2PSIZE: 268435456  # 256MB
       FLEX_HDMA_COLLSIZE: 33554432  # 32MB
     num_gpu_blocks_override: 8192
-  
+
+  granite_4_1_30b_architecture: &granite_4_1_30b_architecture
+    model_type: granite
+    num_hidden_layers: 64
+    max_position_embeddings: 131072
+    hidden_size: 4096
+    vocab_size: 100352
+    num_key_value_heads: 8
+    num_attention_heads: 32
+
+  granite_4_1_3b_architecture: &granite_4_1_3b_architecture
+    model_type: granite
+    num_hidden_layers: 40
+    max_position_embeddings: 131072
+    hidden_size: 2560
+    vocab_size: 100352
+    num_key_value_heads: 8
+    num_attention_heads: 40
+
   llama3_8b_architecture: &llama3_8b_architecture
     model_type: llama
     num_hidden_layers: 32
@@ -44,7 +62,7 @@ _templates:
     vocab_size: 128256
     num_key_value_heads: 8
     num_attention_heads: 32
-  
+
   # device config for TP=4 Llama3 8b models
   llama3_8b_tp4_device_config: &llama3_8b_tp4_device_config
     env_vars:
@@ -100,6 +118,15 @@ _templates:
       FLEX_HDMA_COLLSIZE: 33554432  # 32MB
     num_gpu_blocks_override: 8192
 
+  # device config for TP=4 mistral3 24b models
+  granite4_1_30b_device_config: &granite4_1_30b_device_config
+    env_vars:
+      VLLM_DT_MAX_BATCH_TKV_LIMIT: 131072  # 128k
+      FLEX_HDMA_P2PSIZE: 268435456  # 256MB
+      FLEX_HDMA_COLLSIZE: 33554432  # 32MB
+    num_gpu_blocks_override: 2080
+
+
 models:
   # Granite 3.3 8B Instruct
   ibm-granite/granite-3.3-8b-instruct:
@@ -141,7 +168,29 @@ models:
         max_model_len: 32768
         max_num_seqs: 32
         device_config: *granite_8b_tp4_device_config
-  
+
+
+  # Granite 3.3 8B Instruct
+  ibm-granite/granite-4.1-3b:
+    architecture: *granite_4_1_3b_architecture
+
+    # Continuous batching configurations
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+        device_config: *granite_8b_tp4_device_config
+
+  ibm-granite/granite-4.1-30b:
+    architecture: *granite_4_1_30b_architecture
+
+    # Continuous batching configurations
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+        device_config: *granite4_1_30b_device_config
+
   # Llama 3.1 8B Instruct
   meta-llama/Llama-3.1-8B-Instruct:
     architecture: *llama3_8b_architecture
