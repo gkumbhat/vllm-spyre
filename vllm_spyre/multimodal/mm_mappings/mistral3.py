@@ -48,51 +48,60 @@ class Mistral3MMUtils(MMUtilsBase):
     ) -> torch.Tensor:
         """Get the text or multimodal embeddings for mistral3 using
         the (potentially compiled) FMS model.
+
+        Supports batched encoding: input_ids can be [batch, seq] and
+        mm_features can contain multiple image specs.
         """
         fms_kwargs = {"use_cache": True}
 
         # Only merge multimodal features in prefill; nothing mm in decode
         if mm_features:
-            # Looks for ["pixel_values", "image_sizes"] in mm_features
-            if len(mm_features) != 1:
-                raise ValueError("Currently we assume we only embed one mm request at a time")
-            mm_spec = mm_features[0].data
+            assert not is_decode  # We never pass features in decode
 
-            # when using config and tokenizer are set to `mistral` we don't get
-            # pixel_values in mm_spec. So we are mapping these back here
-            if isinstance(mm_spec, MultiModalKwargsItem) and "images" in mm_spec:
-                mm_spec["pixel_values"] = mm_spec.pop("images")
+            # Collect pixel_values and image_sizes from all mm_features
+            pixel_values_list = []
+            image_sizes_list = []
 
-            if mm_spec is not None:
-                if "pixel_values" not in mm_spec:
-                    raise KeyError("Mistral3 requires pixel_values")
+            for mm_feat in mm_features:
+                mm_spec = mm_feat.data if mm_feat.data else {}
 
-                pixel_values = mm_spec["pixel_values"].data
-                # FMS vision tower expects pixel_values with batch dimension
-                # If squeezed during spec building, add it back
-                if pixel_values.ndim == 3:
-                    pixel_values = pixel_values.unsqueeze(0)
-                fms_kwargs["pixel_values"] = pixel_values
+                # when using config and tokenizer are set to `mistral` we don't get
+                # pixel_values in mm_spec. So we are mapping these back here
+                if isinstance(mm_spec, MultiModalKwargsItem) and "images" in mm_spec:
+                    mm_spec["pixel_values"] = mm_spec.pop("images")
 
-                if "image_sizes" in mm_spec:
-                    # Use the processor's image_sizes which tracks the logical image dimensions
-                    # This is used by the projector to correctly split/merge patches
-                    image_sizes_tensor = mm_spec["image_sizes"].data
-                    if image_sizes_tensor.ndim == 1:
-                        # Single image: convert to list of tuples
-                        image_sizes = [(image_sizes_tensor[0].item(), image_sizes_tensor[1].item())]
+                if mm_spec:
+                    if "pixel_values" not in mm_spec:
+                        raise KeyError("Mistral3 requires pixel_values")
+
+                    pixel_values = mm_spec["pixel_values"].data
+                    # FMS vision tower expects pixel_values with batch dimension
+                    if pixel_values.ndim == 3:
+                        pixel_values = pixel_values.unsqueeze(0)
+                    pixel_values_list.append(pixel_values)
+
+                    if "image_sizes" in mm_spec:
+                        image_sizes_tensor = mm_spec["image_sizes"].data
+                        if image_sizes_tensor.ndim == 1:
+                            image_sizes = [(image_sizes_tensor[0].item(), image_sizes_tensor[1].item())]
+                        else:
+                            image_sizes = [(h.item(), w.item()) for h, w in image_sizes_tensor]
                     else:
-                        # Multiple images
-                        image_sizes = [(h.item(), w.item()) for h, w in image_sizes_tensor]
-                else:
-                    # Mistral image input in vLLM doesn't contain image_sizes as attribute, so we
-                    # are calculating based on pixel_values
-                    # Ref: https://github.com/vllm-project/vllm/blob/f97ca671766c5201404e9fc812e35bf2c4e95a01/vllm/model_executor/models/mistral3.py#L516C9-L518C10
-                    image_sizes = [(img.shape[-2], img.shape[-1]) for img in pixel_values]
+                        # Calculate from pixel_values
+                        image_sizes = [(img.shape[-2], img.shape[-1]) for img in pixel_values]
 
-                fms_kwargs["image_sizes"] = image_sizes
+                    image_sizes_list.append(image_sizes)
+
+            # Batch all images together for single forward pass
+            if pixel_values_list:
+                fms_kwargs["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+                # Flatten image_sizes list of lists to single list
+                fms_kwargs["image_sizes"] = [
+                    size for batch in image_sizes_list for size in batch
+                ]
 
         # The value of iteration does not matter for decode as long as it's > 0
+        # input_ids shape: [batch, seq] for batched requests
         input_embeds, _ = fms_model.prepare_inputs_for_generation(
             iteration=0 if not is_decode else 1, input_ids=input_ids, kwargs=fms_kwargs
         )  # ty: ignore[call-non-callable]

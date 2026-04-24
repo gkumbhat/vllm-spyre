@@ -12,17 +12,29 @@ from vllm.multimodal.inputs import (
 
 from vllm_spyre.multimodal.mm_mappings import MMUtilsBase, MMWarmupInputs
 
-# Extend the adapter as part of the head dim fix; this is needed to
-# load 2b models correctly, but we do it here since this class is
-# currently initialized only once and the adapter extension does not
-# seem to be idempotent.
-#
-# NOTE: If this is made idempotent, we can move this into
-# get_mm_specific_load_overrides(), since it's needed to load.
-serialization.extend_adapter("llava_next", "hf", ["weight_expansion_for_mismatched_head_dim"])
+# Flag to track if adapter has been extended
+_ADAPTER_EXTENDED = False
 
 
 class LlavaNextMMUtils(MMUtilsBase):
+    @classmethod
+    def _ensure_adapter_extended(cls):
+        """Extend the adapter as part of the head dim fix; this is needed to
+        load 2b models correctly. We do this lazily to avoid import-time errors
+        when the architecture hasn't been registered yet.
+
+        NOTE: The adapter extension does not seem to be idempotent, so we only
+        do it once using a module-level flag.
+        """
+        global _ADAPTER_EXTENDED
+        if not _ADAPTER_EXTENDED:
+            try:
+                serialization.extend_adapter("llava_next", "hf", ["weight_expansion_for_mismatched_head_dim"])
+                _ADAPTER_EXTENDED = True
+            except KeyError:
+                # Architecture not registered yet - will be called again later
+                pass
+
     @staticmethod
     def _validate_configs(fms_config: ModelConfig, hf_config: PretrainedConfig):
         """Ensure that configs are properly typed. Additional validation, e.g.,
@@ -59,6 +71,9 @@ class LlavaNextMMUtils(MMUtilsBase):
         TODO: If additional variants of granite vision are added, or broader
         llava next support is added in FMS, handle it properly here.
         """
+        # Ensure adapter is extended before loading
+        LlavaNextMMUtils._ensure_adapter_extended()
+
         return {
             "override_hf_pretrained_config": True,
             "text_config": {"head_dim": 128},
@@ -73,6 +88,9 @@ class LlavaNextMMUtils(MMUtilsBase):
     ) -> torch.Tensor:
         """Get the text or multimodal embeddings for Llava Next using
         the (potentially compiled) FMS model.
+
+        Supports batched encoding: input_ids can be [batch, seq] and
+        mm_features can contain multiple image specs.
         """
         fms_kwargs = {"use_cache": True}
         mm_spec_keys = ["pixel_values", "image_sizes"]
@@ -80,28 +98,37 @@ class LlavaNextMMUtils(MMUtilsBase):
         # Only merge multimodal features in prefill; nothing mm in decode
         if mm_features:
             assert not is_decode  # We never pass features in decode
-            if len(mm_features) != 1:
-                raise ValueError("Currently we assume we only embed one mm request at a time")
-            mm_spec = mm_features[0].data
-            if mm_spec is not None:
-                # NOTE: This should be pretty safe as it's dependent on the
-                # vLLM/HF processor objects, but we check it anyway to be safe
-                # for now, since transformers 5.0 is just around the corner.
-                if any(k not in mm_spec for k in mm_spec_keys):
-                    raise KeyError(f"Llava Next requires kwargs: {mm_spec_keys}")
 
-                fms_kwargs["pixel_values"] = mm_spec["pixel_values"].data
-                image_sizes = mm_spec["image_sizes"].data
+            # Collect pixel_values and image_sizes from all mm_features
+            pixel_values_list = []
+            image_sizes_list = []
 
-                # Careful about this; if it's 1D, we'll a tensor of shape
-                # [x, y], which will break in a weird way in image packing,
-                # since it assumes it's 2D and will get sad about getting
-                # an int instead of an iterable
-                if image_sizes.ndim == 1:
-                    image_sizes = image_sizes.unsqueeze(0)
-                fms_kwargs["image_sizes"] = image_sizes
+            for mm_feat in mm_features:
+                mm_spec = mm_feat.data if mm_feat.data else {}
+                if mm_spec:
+                    if any(k not in mm_spec for k in mm_spec_keys):
+                        raise KeyError(f"Llava Next requires kwargs: {mm_spec_keys}")
+
+                    pv = mm_spec["pixel_values"].data
+                    image_sizes = mm_spec["image_sizes"].data
+
+                    # Ensure pixel_values has batch dimension [1, channels, h, w]
+                    if pv.ndim == 3:
+                        pv = pv.unsqueeze(0)
+                    pixel_values_list.append(pv)
+
+                    # Ensure image_sizes is 2D [num_images, 2]
+                    if image_sizes.ndim == 1:
+                        image_sizes = image_sizes.unsqueeze(0)
+                    image_sizes_list.append(image_sizes)
+
+            # Batch all images together for single forward pass
+            if pixel_values_list:
+                fms_kwargs["pixel_values"] = torch.cat(pixel_values_list, dim=0)
+                fms_kwargs["image_sizes"] = torch.cat(image_sizes_list, dim=0)
 
         # The value of iteration does not matter for decode as long as it's > 0
+        # input_ids shape: [batch, seq] for batched requests
         input_embeds, _ = fms_model.prepare_inputs_for_generation(
             iteration=0 if not is_decode else 1, input_ids=input_ids, kwargs=fms_kwargs
         )  # ty: ignore[call-non-callable]

@@ -35,6 +35,9 @@ from vllm_spyre.platform import SpyrePlatform
 from vllm_spyre.utils import exact_div
 from vllm_spyre.v1.sample.spyre_logits_processor import build_logitsprocs_for_cb
 
+if TYPE_CHECKING:
+    from vllm_spyre.multimodal.mm_coordinator import MMCoordinator
+
 # yapf conflicts with ruff for this block
 # yapf: disable
 from vllm_spyre.v1.worker.spyre_input_batch import (
@@ -695,6 +698,9 @@ class ChunkedPrefillModelRunner(
 
         self._enable_prefix_caching = vllm_config.cache_config.enable_prefix_caching
 
+        # MMCoordinator for deduplicating vision encoder computation across TP workers
+        self._mm_coordinator: "MMCoordinator | None" = None
+
         # TODO: Remove this once we can prefill and decode in the same step
         self.prefill_batch = SamplingInputBatch(
             # TODO: review this, currently we only support prefill for
@@ -735,6 +741,10 @@ class ChunkedPrefillModelRunner(
     def prompt_len(request: NewRequestData | Request) -> int:
         assert request.prompt_token_ids is not None, "prompt token ids are required"
         return len(request.prompt_token_ids)
+
+    def set_mm_coordinator(self, coordinator: "MMCoordinator") -> None:
+        """Set the MMCoordinator for deduplicating vision encoder computation."""
+        self._mm_coordinator = coordinator
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks = list[SupportedTask]()
@@ -1025,21 +1035,28 @@ class ChunkedPrefillModelRunner(
         # For multimodal requests, compute embeddings once for the full sequence
         # and cache them, then slice per chunk. This ensures image features are
         # correctly aligned across all chunks.
+        # Note: Encoding was already submitted at the top of execute_model() in
+        # spyre_worker.py, so we just need to retrieve the result.
         if mm_features and request.cached_mm_embeddings is None:
-            # First chunk: compute full multimodal embeddings
-            full_input_tokens = torch.tensor(
-                prompt_token_ids, dtype=torch.int64, device=self.device
-            ).unsqueeze(0)
-
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
-                mm_features=mm_features,
-                is_decode=False,
-            )
+
+            # Use MMCoordinator for deduplicated encoding across TP ranks
+            if self._mm_coordinator is not None:
+                # All ranks: get the embedding (waits if not ready)
+                full_embeds = self._mm_coordinator.get_embedding(req_id, timeout=60.0)
+                full_embeds = full_embeds.to(self.device)
+            else:
+                # TP=1 case: compute embeddings directly
+                full_input_tokens = torch.tensor(
+                    prompt_token_ids, dtype=torch.int64, device=self.device
+                ).unsqueeze(0)
+                full_embeds = self.model.get_maybe_mm_embeddings(
+                    full_input_tokens,
+                    mm_features=mm_features,
+                    is_decode=False,
+                )
 
             t1 = time.time() - t0
-
             logger.info("maybe_mm_embedding processing time: %.2fms", (t1 * 1000))
 
             # Cache the full embeddings for subsequent chunks
@@ -1488,6 +1505,9 @@ class ChunkedPrefillModelRunner(
 
         model_input = self.prepare_model_input(scheduler_output)
         is_prefill = model_input.is_prompt
+
+        # Track mode switching between prefill and decode
+        step_type = "PREFILL" if is_prefill else "DECODE"
 
         # Execute the model
         attn_metadata = self.build_attn_metadata(model_input)

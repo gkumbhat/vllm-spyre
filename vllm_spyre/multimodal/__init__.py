@@ -1,5 +1,6 @@
 import transformers
 
+from vllm_spyre.multimodal.mm_coordinator import MMCoordinator, cleanup_stale_shared_memory
 from vllm_spyre.multimodal.mm_mappings import LlavaNextMMUtils, Mistral3MMUtils, MMUtilsBase
 
 # Maps transformers classes to the corresponding utils

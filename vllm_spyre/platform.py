@@ -199,6 +199,16 @@ class SpyrePlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_spyre.v1.worker.spyre_worker.SpyreWorker"
 
+        # Use SpyreExecutor for multiprocessing to enable MMCoordinator support
+        # Only needed when tensor parallelism is enabled
+        if (
+            parallel_config.world_size > 1
+            and parallel_config.distributed_executor_backend == "mp"
+        ):
+            parallel_config.distributed_executor_backend = (
+                "vllm_spyre.v1.executor.spyre_executor.SpyreExecutor"
+            )
+
         cls._check_threading_config(parallel_config.world_size)
 
         # set env vars based on the model
