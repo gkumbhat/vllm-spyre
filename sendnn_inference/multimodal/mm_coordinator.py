@@ -161,22 +161,11 @@ class MMCoordinator:
                 raise RuntimeError("rank-0 requires result_queues")
 
             # Start thread pool
+            # Use 32 workers: enough for concurrent encoding without excessive overhead
             self._executor = ThreadPoolExecutor(
                 max_workers=32, thread_name_prefix="mm-encoder"
             )
             logger.info("MMCoordinator: ThreadPoolExecutor created with max_workers=32")
-
-            # Test that the thread pool is working
-            def test_func():
-                logger.info("MMCoordinator: Thread pool test function executed successfully")
-                return "test"
-
-            test_future = self._executor.submit(test_func)
-            try:
-                result = test_future.result(timeout=5.0)
-                logger.info("MMCoordinator: Thread pool test passed, result=%s", result)
-            except Exception as e:
-                logger.error("MMCoordinator: Thread pool test FAILED: %s", e, exc_info=True)
 
             # Start submission listener thread
             self._submission_listener = threading.Thread(
@@ -203,25 +192,21 @@ class MMCoordinator:
         logger.info("Submission listener thread started on rank-0")
         while not self._shutdown:
             try:
-                item = self._submission_queue.get(timeout=0.5)
+                item = self._submission_queue.get(timeout=0.1)
                 if item is None:
                     # Shutdown sentinel
                     logger.info("Submission listener received shutdown sentinel")
                     break
 
                 request_id, prompt_token_ids, mm_features = item
-                logger.info("Submission listener received request: %s", request_id)
 
                 # Ensure model is set (may be set lazily)
                 if self._fms_model is None:
-                    logger.info("Model not set, attempting to set from model_runner")
                     if self.model_runner is not None:
-                        logger.info("Setting model and utils")
                         self.set_model_and_utils(
                             self.model_runner.model.fms_model,
                             self.model_runner.model.mm_model_utils,
                         )
-                        logger.info("Model and utils set successfully")
                     else:
                         logger.error("model_runner is None, cannot set model")
                         continue
@@ -232,9 +217,7 @@ class MMCoordinator:
                 ).unsqueeze(0)
 
                 # Submit encoding
-                logger.info("Calling submit_encoding for request: %s", request_id)
                 self.submit_encoding(request_id, input_ids, mm_features)
-                logger.info("submit_encoding returned for request: %s", request_id)
 
             except mp.queues.Empty:
                 continue
@@ -266,11 +249,9 @@ class MMCoordinator:
         with self._futures_lock:
             if request_id in self._encoding_futures:
                 # Already being processed
-                logger.info("MMCoordinator: request %s already being processed", request_id)
                 return
             if request_id in self._local_embeddings:
                 # Already completed
-                logger.info("MMCoordinator: request %s already completed", request_id)
                 return
 
             # Create event for this request
@@ -278,7 +259,6 @@ class MMCoordinator:
                 self._local_events[request_id] = threading.Event()
 
             # Submit to thread pool
-            logger.info("MMCoordinator: submitting encoding for request %s to thread pool", request_id)
             future = self._executor.submit(
                 self._encode_and_broadcast,
                 request_id,
@@ -286,8 +266,6 @@ class MMCoordinator:
                 mm_features,
             )
             self._encoding_futures[request_id] = future
-
-        logger.info("MMCoordinator submitted encoding request: %s", request_id)
 
     def _encode_and_broadcast(
         self, request_id: str, input_ids: torch.Tensor, mm_features: Any
@@ -312,12 +290,8 @@ class MMCoordinator:
                 dtype=embeddings.dtype,
             )
 
-            logger.info("MMCoordinator broadcasting result for %s to %d queues", request_id, len(self._result_queues))
-            for i, queue in enumerate(self._result_queues):  # type: ignore
+            for queue in self._result_queues:  # type: ignore
                 queue.put(result)
-                logger.info("MMCoordinator put result for %s on queue %d", request_id, i)
-
-            logger.info("MMCoordinator broadcast complete for: %s", request_id)
 
         except Exception as e:
             logger.error(f"MM encoding failed for {request_id}: {e}", exc_info=True)
@@ -396,121 +370,71 @@ class MMCoordinator:
 
     def _poll_results(self) -> None:
         """Poll result queue and cache results locally."""
-        logger.info("Poller thread started, rank=%d", self.rank if hasattr(self, 'rank') else -1)
-        while not self._shutdown:
-            try:
-                # Process ALL available results without delay
-                # This prevents head-of-line blocking when results arrive out of order
-                result: MMEncodingResult = self._result_queue.get(timeout=0.5)  # type: ignore
+        logger.info("Poller thread started")
 
-                request_id = result.request_id
-                logger.info("Poller received result for request: %s", request_id)
+        def process_result(result: MMEncodingResult) -> None:
+            """Process a single result (error or success)."""
+            request_id = result.request_id
 
-                if result.error:
-                    # Store error
+            if result.error:
+                # Store error
+                with self._cache_lock:
+                    if request_id not in self._local_events:
+                        self._local_events[request_id] = threading.Event()
+                    self._local_errors[request_id] = RuntimeError(result.error)
+                    self._local_events[request_id].set()
+            else:
+                # Read from SharedMemory
+                try:
+                    shm = shared_memory.SharedMemory(name=result.shm_name)
+                    numel = 1
+                    for dim in result.shape:
+                        numel *= dim
+                    element_size = torch.tensor([], dtype=result.dtype).element_size()
+                    size = numel * element_size
+
+                    # Copy data to avoid non-writable buffer warning
+                    data = bytes(shm.buf[:size])
+                    np_array = np.frombuffer(
+                        data, dtype=torch_dtype_to_numpy(result.dtype)
+                    ).reshape(result.shape).copy()
+                    tensor = torch.from_numpy(np_array)
+
+                    # Cache locally (keep on CPU, model runner will move to device)
                     with self._cache_lock:
-                        # Create event if it doesn't exist
                         if request_id not in self._local_events:
                             self._local_events[request_id] = threading.Event()
-                        self._local_errors[request_id] = RuntimeError(result.error)
+                        self._local_embeddings[request_id] = tensor
+                        self._shm_registry[request_id] = shm  # Keep reference
                         self._local_events[request_id].set()
-                else:
-                    # Read from SharedMemory
-                    try:
-                        logger.debug("Poller reading SharedMemory for: %s", request_id)
-                        shm = shared_memory.SharedMemory(name=result.shm_name)
-                        numel = 1
-                        for dim in result.shape:
-                            numel *= dim
-                        element_size = torch.tensor([], dtype=result.dtype).element_size()
-                        size = numel * element_size
+                except Exception as e:
+                    logger.error("Poller failed to process result for %s: %s", request_id, e)
+                    # Store error and set event so waiting threads don't hang
+                    with self._cache_lock:
+                        if request_id not in self._local_events:
+                            self._local_events[request_id] = threading.Event()
+                        self._local_errors[request_id] = e
+                        self._local_events[request_id].set()
 
-                        logger.debug("Poller copying data from SHM for: %s (size=%d)", request_id, size)
-                        # Copy data to avoid non-writable buffer warning
-                        # Use numpy directly to avoid torch.frombuffer warning
-                        data = bytes(shm.buf[:size])
-                        np_array = np.frombuffer(data, dtype=torch_dtype_to_numpy(result.dtype)).reshape(result.shape).copy()
-                        tensor = torch.from_numpy(np_array)
+        while not self._shutdown:
+            try:
+                # Get first result with timeout (reduced for lower latency)
+                result: MMEncodingResult = self._result_queue.get(timeout=0.1)  # type: ignore
+                process_result(result)
 
-                        logger.debug("Poller moving tensor to device for: %s (device=%s)", request_id, self.device)
-                        # Move to correct device - keep on CPU for now to avoid device issues
-                        # The model runner will move to correct device when needed
-                        # if self.device is not None and self.device.type != "cpu":
-                        #     tensor = tensor.to(self.device)
-
-                        logger.debug("Poller caching result for: %s", request_id)
-                        # Cache locally
-                        with self._cache_lock:
-                            # Create event if it doesn't exist
-                            if request_id not in self._local_events:
-                                self._local_events[request_id] = threading.Event()
-                                logger.debug("Poller created event for: %s", request_id)
-                            self._local_embeddings[request_id] = tensor
-                            self._shm_registry[request_id] = shm  # Keep reference
-                            self._local_events[request_id].set()
-                            logger.info("Poller set event for: %s", request_id)
-
-                        logger.debug("MMCoordinator cached result for: %s", request_id)
-                    except Exception as e:
-                        logger.error("Poller failed to process result for %s: %s", request_id, e, exc_info=True)
-                        # Store error and set event so waiting threads don't hang
-                        with self._cache_lock:
-                            if request_id not in self._local_events:
-                                self._local_events[request_id] = threading.Event()
-                            self._local_errors[request_id] = e
-                            self._local_events[request_id].set()
-
-                # Immediately check for more results (no timeout)
-                # This drains the queue quickly to prevent head-of-line blocking
+                # Fast-drain: process all available results immediately
                 while True:
                     try:
                         result = self._result_queue.get_nowait()  # type: ignore
-                        request_id = result.request_id
-                        logger.info("Poller received result for request: %s (no-wait)", request_id)
-
-                        if result.error:
-                            with self._cache_lock:
-                                if request_id not in self._local_events:
-                                    self._local_events[request_id] = threading.Event()
-                                self._local_errors[request_id] = RuntimeError(result.error)
-                                self._local_events[request_id].set()
-                        else:
-                            try:
-                                shm = shared_memory.SharedMemory(name=result.shm_name)
-                                numel = 1
-                                for dim in result.shape:
-                                    numel *= dim
-                                element_size = torch.tensor([], dtype=result.dtype).element_size()
-                                size = numel * element_size
-                                data = bytes(shm.buf[:size])
-                                np_array = np.frombuffer(data, dtype=torch_dtype_to_numpy(result.dtype)).reshape(result.shape).copy()
-                                tensor = torch.from_numpy(np_array)
-                                # Keep on CPU to avoid device issues
-                                # if self.device is not None and self.device.type != "cpu":
-                                #     tensor = tensor.to(self.device)
-                                with self._cache_lock:
-                                    if request_id not in self._local_events:
-                                        self._local_events[request_id] = threading.Event()
-                                    self._local_embeddings[request_id] = tensor
-                                    self._shm_registry[request_id] = shm
-                                    self._local_events[request_id].set()
-                                    logger.info("Poller set event for: %s (no-wait)", request_id)
-                                logger.debug("MMCoordinator cached result for: %s", request_id)
-                            except Exception as e:
-                                logger.error("Poller failed to process result for %s (no-wait): %s", request_id, e, exc_info=True)
-                                with self._cache_lock:
-                                    if request_id not in self._local_events:
-                                        self._local_events[request_id] = threading.Event()
-                                    self._local_errors[request_id] = e
-                                    self._local_events[request_id].set()
+                        process_result(result)
                     except mp.queues.Empty:
-                        break  # No more results available, go back to blocking wait
+                        break  # No more results, go back to blocking wait
 
             except mp.queues.Empty:
                 continue
             except Exception as e:
                 if not self._shutdown:
-                    logger.error("MMCoordinator poller error: %e", e)
+                    logger.error("MMCoordinator poller error: %s", e)
 
     def get_embedding(
         self,

@@ -497,37 +497,6 @@ class SpyreWorker(WorkerBase):
 
         logger.info("MM coordinator initialization complete on rank %d", self.rank)
 
-    def trigger_mm_encoding(self, request_id: str, prompt_token_ids: list[int], mm_features: Any) -> None:
-        """Trigger MM encoding for a request (rank-0 only).
-
-        Called via collective_rpc by the executor before execute_model.
-        Only rank-0 actually submits the encoding - other ranks are no-ops.
-
-        Args:
-            request_id: Unique request identifier
-            prompt_token_ids: Token IDs for the request
-            mm_features: MultiModalFeatureSpec for the request
-        """
-        if self.mm_coordinator is None:
-            return
-
-        if self.mm_coordinator.is_rank0:
-            # Ensure model is set (may be set lazily)
-            if self.mm_coordinator._fms_model is None:
-                self.mm_coordinator.set_model_and_utils(
-                    self.model_runner.model.fms_model,
-                    self.model_runner.model.mm_model_utils,
-                )
-
-            # Create input tensor
-            input_ids = torch.tensor(
-                prompt_token_ids, dtype=torch.int64
-            ).unsqueeze(0)
-
-            # Submit encoding (idempotent - safe to call multiple times)
-            self.mm_coordinator.submit_encoding(request_id, input_ids, mm_features)
-            logger.debug("Triggered MM encoding for request: %s", request_id)
-
     def shutdown_mm_coordinator(self) -> None:
         """Shutdown the MM coordinator.
 

@@ -228,9 +228,8 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         else:
             mm_features_list = mm_features
 
-        # Multimodal request
+        # Multimodal request - use coordinator for de-duplication
         # Skip coordinator for warmup requests (request_id starts with "warmup-")
-        logger.info(f"DEBUG get_maybe_mm_embeddings: request_id={request_id}, has_coordinator={self._mm_coordinator is not None}, is_warmup={request_id.startswith('warmup-') if request_id else 'None'}")
         if (
             self._mm_coordinator is not None
             and request_id is not None
@@ -252,13 +251,8 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
                 raise
 
 
-            # CRITICAL: Coordinator returns embeddings on CPU (from poller thread)
-            # Must move to correct device before using in model forward pass
+            # Coordinator returns embeddings on CPU - move to correct device
             if embeddings.device != self.device:
-                logger.debug(
-                    "Moving embeddings from %s to %s for request %s",
-                    embeddings.device, self.device, request_id
-                )
                 embeddings = embeddings.to(self.device)
         else:
             # No coordinator (warmup or fallback) - direct call

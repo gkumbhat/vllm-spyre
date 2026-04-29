@@ -176,43 +176,12 @@ class SpyreExecutor(MultiprocExecutor):
     def execute_model(
         self, scheduler_output: SchedulerOutput, non_block: bool = False
     ) -> Any:
-        """Execute model with MM encoding fallback.
+        """Execute model.
 
-        MM encoding is primarily triggered in Scheduler.add_request() when requests
-        arrive (enabling pipelining). This method contains a fallback trigger for:
-        - Warmup requests (which should send encoding directly)
-        - Any path where scheduler callback was not invoked
-        - Edge cases where timing requires immediate encoding
-
-        For normal multimodal inference, the scheduler callback at request arrival
-        should handle encoding submission, so requests reach chunk-0 with embeddings
-        cached and ready.
+        MM encoding is triggered in Scheduler.add_request() when requests arrive,
+        enabling pipelining. The coordinator's get_embedding() has a fallback that
+        submits encoding if it wasn't pre-submitted, so no fallback needed here.
         """
-        tp_size = self.parallel_config.tensor_parallel_size
-
-        # FALLBACK: Trigger MM encoding for new requests that may not have been
-        # submitted via scheduler callback (e.g., warmup requests).
-        # The coordinator's submit_encoding is idempotent, so if encoding was already
-        # submitted via scheduler.add_request(), this is a no-op.
-        if tp_size > 1 and self._mm_submission_queue is not None:
-            for req in scheduler_output.scheduled_new_reqs:
-                mm_features = getattr(req, "mm_features", None)
-                if mm_features:
-                    try:
-                        self._mm_submission_queue.put(
-                            (req.req_id, req.prompt_token_ids, mm_features),
-                            timeout=0.5
-                        )
-                        logger.debug(
-                            "Fallback/redundant MM encoding submission for: %s",
-                            req.req_id
-                        )
-                    except Exception as e:
-                        logger.debug(
-                            "Fallback MM encoding queue submission failed for %s: %s",
-                            req.req_id, e
-                        )
-
         # Call parent execute_model which dispatches to workers
         return super().execute_model(scheduler_output, non_block)
 
