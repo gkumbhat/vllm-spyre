@@ -164,7 +164,7 @@ class MMCoordinator:
             self._executor = ThreadPoolExecutor(
                 max_workers=32, thread_name_prefix="mm-encoder"
             )
-            logger.info("MMCoordinator: ThreadPoolExecutor created with max_workers=4")
+            logger.info("MMCoordinator: ThreadPoolExecutor created with max_workers=32")
 
             # Test that the thread pool is working
             def test_func():
@@ -544,14 +544,19 @@ class MMCoordinator:
         # This handles cases where the scheduler callback didn't fire
         # (e.g., request was queued before reaching add_request())
         if self.is_rank0:
+            # Check if submission needed WITHOUT holding lock to avoid deadlock
+            needs_submission = False
             with self._futures_lock:
                 if request_id not in self._encoding_futures:
-                    logger.warning(
-                        "MM encoding for %s was not pre-submitted, submitting now (fallback)",
-                        request_id
-                    )
-                    # submit_encoding is idempotent, safe to call even if already submitted
-                    self.submit_encoding(request_id, input_ids, mm_features)
+                    needs_submission = True
+
+            if needs_submission:
+                logger.warning(
+                    "MM encoding for %s was not pre-submitted, submitting now (fallback)",
+                    request_id
+                )
+                # submit_encoding is idempotent and acquires its own lock
+                self.submit_encoding(request_id, input_ids, mm_features)
 
         # RANK-0 FAST PATH: Check if encoding future is done
         # This avoids waiting for the poller thread to process the result
