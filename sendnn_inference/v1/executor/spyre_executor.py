@@ -1,0 +1,250 @@
+"""SpyreExecutor: Extends MultiprocExecutor to create MM queues pre-fork.
+
+This executor creates the submission_queue and result_queues before spawning
+worker processes, so they are properly inherited by the forked workers.
+
+Architecture:
+- submission_queue: EngineCore -> rank-0 (for MM encoding requests)
+- result_queues: rank-0 encoder -> each rank's poller (for MM results)
+
+Both queues must exist before worker spawn to avoid daemon process issues.
+
+MM Encoding Submission Flow (ADR-001):
+1. Executor creates submission_queue pre-fork
+2. Executor sets global MM callback in scheduler module
+3. When requests arrive at scheduler (EngineCore), add_request() is called
+4. Scheduler calls the global callback with (req_id, prompt_tokens, mm_features)
+5. Callback puts (req_id, prompt_tokens, mm_features) on submission_queue
+6. rank-0 worker's submission listener thread picks up the item
+7. Listener submits encoding to coordinator's thread pool
+8. Encoding runs in parallel during other requests' prefill/decode
+9. By the time chunk-0 runs, embedding is cached (pipelined!)
+"""
+
+import multiprocessing as mp
+from typing import Optional, List, Any
+
+from vllm.config import VllmConfig
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.core.sched.output import SchedulerOutput
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+# Manager for creating picklable queue proxies
+_mm_manager: Optional[Any] = None
+_mm_submission_queue: Optional[Any] = None
+_mm_result_queues: Optional[List[Any]] = None
+
+
+class SpyreExecutor(MultiprocExecutor):
+    """Spyre-specific executor that creates MM queues pre-fork."""
+
+    def __init__(self, vllm_config: VllmConfig, monitor_workers: bool = True):
+        # Create Manager and queues BEFORE calling super().__init__() which spawns workers
+        # Manager().Queue() creates picklable proxy objects that can be passed via RPC
+        global _mm_manager, _mm_submission_queue, _mm_result_queues
+
+        # Get TP size to know how many result queues to create
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+
+        logger.info("SpyreExecutor.__init__: tp_size=%d", tp_size)
+
+        # Store as instance variables for use in execute_model
+        self._mm_submission_queue = None
+        self._mm_manager = None
+
+        # Only create queues if TP > 1 (multi-worker scenario)
+        # For TP=1, no de-duplication is needed
+        if tp_size > 1:
+            # Create a Manager to get picklable queue proxies
+            _mm_manager = mp.Manager()
+            self._mm_manager = _mm_manager
+
+            # Create submission queue (EngineCore -> rank-0)
+            # Using Manager().Queue() creates a proxy that can be pickled
+            _mm_submission_queue = _mm_manager.Queue()
+            self._mm_submission_queue = _mm_submission_queue
+
+            # Create result queues (rank-0 -> each rank)
+            _mm_result_queues = [_mm_manager.Queue() for _ in range(tp_size)]
+
+            logger.info(
+                "Created MM Manager queues: 1 submission queue, %d result queues",
+                tp_size,
+            )
+
+            # Set up the global MM encoding callback BEFORE workers are spawned
+            # This ensures the callback is available when the scheduler is created
+            # (which happens in EngineCore, before workers start)
+            logger.info("Calling _setup_mm_encoding_callback()...")
+            self._setup_mm_encoding_callback(_mm_submission_queue)
+            logger.info("_setup_mm_encoding_callback() completed")
+        else:
+            logger.info("TP size is 1, skipping MM queue creation")
+
+        # Now call parent __init__ which spawns workers
+        # Parent class will automatically call _post_init_executor() after workers are ready
+        logger.info("Calling super().__init__()...")
+        super().__init__(vllm_config, monitor_workers)
+        logger.info("super().__init__() completed - MM coordinators initialized via _post_init_executor()")
+
+    def _setup_mm_encoding_callback(self, submission_queue: mp.Queue) -> None:
+        """Set up the global MM encoding callback in the scheduler module.
+
+        This creates a callback function that closes over the submission_queue
+        and can be called from the scheduler when requests arrive.
+
+        The callback is set as a module-level variable in sendnn_inference.v1.core.scheduler
+        so it's available in any process that imports the scheduler (including EngineCore).
+        """
+        logger.info("_setup_mm_encoding_callback: Starting...")
+
+        if submission_queue is None:
+            logger.error("_setup_mm_encoding_callback: submission_queue is None!")
+            return
+
+        logger.info("_setup_mm_encoding_callback: Importing set_global_mm_encoding_callback...")
+
+        # Import here to avoid circular imports
+        try:
+            from sendnn_inference.v1.core.scheduler import set_global_mm_encoding_callback
+            logger.info("_setup_mm_encoding_callback: Import successful")
+        except Exception as e:
+            logger.error("_setup_mm_encoding_callback: Import failed: %s", e, exc_info=True)
+            raise
+
+        def enqueue_mm_encoding(request_id: str, prompt_token_ids: list[int], mm_features: Any) -> None:
+            """Submit MM encoding request to rank-0 worker.
+
+            This is called by the scheduler when multimodal requests arrive,
+            at the earliest possible point (request arrival).
+
+            Args:
+                request_id: Unique request identifier
+                prompt_token_ids: Token IDs for the prompt
+                mm_features: Multimodal features from the request
+            """
+            try:
+                # No timeout - block until queue has space
+                # The queue is unbounded (maxsize=0) so this should never block in practice
+                submission_queue.put((request_id, prompt_token_ids, mm_features))
+                logger.info("MM callback: Queued encoding submission for request: %s", request_id)
+            except Exception as e:
+                logger.error("MM callback: Failed to queue MM encoding for request %s: %s", request_id, e, exc_info=True)
+
+        # Set the global callback so the scheduler can use it when requests arrive
+        logger.info("_setup_mm_encoding_callback: Calling set_global_mm_encoding_callback...")
+        set_global_mm_encoding_callback(enqueue_mm_encoding)
+        logger.info("_setup_mm_encoding_callback: Callback set successfully")
+
+    def _post_init_executor(self) -> None:
+        """Called after workers are spawned and ready.
+
+        Pass Manager queue proxies to workers via RPC.
+        Manager queues are picklable and can be safely passed across processes.
+        """
+        logger.info("_post_init_executor called")
+
+        tp_size = self.parallel_config.tensor_parallel_size
+        logger.info("_post_init_executor: tp_size=%d", tp_size)
+
+        if tp_size > 1:
+            global _mm_submission_queue, _mm_result_queues
+
+            if _mm_submission_queue is None or _mm_result_queues is None:
+                logger.error("MM queues are None - cannot initialize coordinators")
+                return
+
+            logger.info("_post_init_executor: Passing MM queues to workers via collective_rpc...")
+
+            # Use collective_rpc to pass queues to all workers
+            # Manager queue proxies are picklable, so this works
+            self.collective_rpc(
+                "initialize_mm_coordinator",
+                kwargs={
+                    "submission_queue": _mm_submission_queue,
+                    "result_queues": _mm_result_queues,
+                }
+            )
+
+            logger.info("MM coordinators initialized on all workers")
+        else:
+            logger.info("_post_init_executor: TP size is 1, skipping coordinator initialization")
+
+    def execute_model(
+        self, scheduler_output: SchedulerOutput, non_block: bool = False
+    ) -> Any:
+        """Execute model with MM encoding fallback.
+
+        MM encoding is primarily triggered in Scheduler.add_request() when requests
+        arrive (enabling pipelining). This method contains a fallback trigger for:
+        - Warmup requests (which should send encoding directly)
+        - Any path where scheduler callback was not invoked
+        - Edge cases where timing requires immediate encoding
+
+        For normal multimodal inference, the scheduler callback at request arrival
+        should handle encoding submission, so requests reach chunk-0 with embeddings
+        cached and ready.
+        """
+        tp_size = self.parallel_config.tensor_parallel_size
+
+        # FALLBACK: Trigger MM encoding for new requests that may not have been
+        # submitted via scheduler callback (e.g., warmup requests).
+        # The coordinator's submit_encoding is idempotent, so if encoding was already
+        # submitted via scheduler.add_request(), this is a no-op.
+        if tp_size > 1 and self._mm_submission_queue is not None:
+            for req in scheduler_output.scheduled_new_reqs:
+                mm_features = getattr(req, "mm_features", None)
+                if mm_features:
+                    try:
+                        self._mm_submission_queue.put(
+                            (req.req_id, req.prompt_token_ids, mm_features),
+                            timeout=0.5
+                        )
+                        logger.debug(
+                            "Fallback/redundant MM encoding submission for: %s",
+                            req.req_id
+                        )
+                    except Exception as e:
+                        logger.debug(
+                            "Fallback MM encoding queue submission failed for %s: %s",
+                            req.req_id, e
+                        )
+
+        # Call parent execute_model which dispatches to workers
+        return super().execute_model(scheduler_output, non_block)
+
+    def shutdown(self):
+        """Properly shut down MM coordinators before parent cleanup."""
+        tp_size = self.parallel_config.tensor_parallel_size
+
+        if tp_size > 1:
+            try:
+                # Shutdown MM coordinators on all workers
+                self.collective_rpc(
+                    "shutdown_mm_coordinator",
+                    timeout=5.0,
+                )
+            except Exception as e:
+                logger.warning("Error shutting down MM coordinators: %s", e)
+
+            # Send shutdown sentinel to submission queue (if it exists)
+            global _mm_submission_queue, _mm_manager
+            if _mm_submission_queue is not None:
+                try:
+                    _mm_submission_queue.put(None)  # Shutdown sentinel
+                except Exception:
+                    pass
+
+            # Shutdown the Manager
+            if _mm_manager is not None:
+                try:
+                    _mm_manager.shutdown()
+                    logger.info("MM Manager shutdown complete")
+                except Exception as e:
+                    logger.warning("Error shutting down MM Manager: %s", e)
+
+        # Call parent shutdown for worker cleanup
+        super().shutdown()

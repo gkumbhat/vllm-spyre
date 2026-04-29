@@ -154,6 +154,9 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         # Requests
         self.requests: dict[str, RequestStateT] = {}
 
+        # MM coordinator for vision encoder de-duplication (ADR-001)
+        self._mm_coordinator: Any | None = None
+
     @abstractmethod
     def build_input_batch(self) -> InputBatchT:
         raise NotImplementedError
@@ -179,6 +182,104 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         if not self.is_multimodal:
             return None
         return self.model.mm_model_utils
+
+    def set_mm_coordinator(self, coordinator) -> None:
+        """Set the MM coordinator for vision encoder de-duplication.
+
+        Args:
+            coordinator: MMCoordinator instance
+        """
+        self._mm_coordinator = coordinator
+
+    def get_maybe_mm_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        mm_features: list | None,
+        is_decode: bool,
+        request_id: str | None = None,
+    ) -> torch.Tensor:
+        """Get multimodal embeddings, using coordinator if available.
+
+        On rank-0: Directly calls model's get_maybe_mm_embeddings
+        On other ranks: Fetches from coordinator via IPC
+
+        Args:
+            input_ids: Token IDs (batched)
+            mm_features: MultiModalFeatureSpec list or single spec
+            is_decode: Whether this is a decode step
+            request_id: Unique request identifier for coordinator lookup
+
+        Returns:
+            embeddings: Tensor of shape (batch, seq_len, hidden_dim)
+        """
+        if not mm_features:
+            # No multimodal features - use standard embedding lookup
+            # This path is for text-only requests
+            assert self._model is not None
+            return self.model.get_maybe_mm_embeddings(
+                input_ids,
+                mm_features=None,
+                is_decode=is_decode,
+            )
+
+        # Normalize mm_features to a list if it's a single spec
+        if not isinstance(mm_features, list):
+            mm_features_list = [mm_features]
+        else:
+            mm_features_list = mm_features
+
+        # Multimodal request
+        # Skip coordinator for warmup requests (request_id starts with "warmup-")
+        logger.info(f"DEBUG get_maybe_mm_embeddings: request_id={request_id}, has_coordinator={self._mm_coordinator is not None}, is_warmup={request_id.startswith('warmup-') if request_id else 'None'}")
+        if (
+            self._mm_coordinator is not None
+            and request_id is not None
+            and not request_id.startswith("warmup-")
+        ):
+            # Use coordinator for de-duplication
+            # Coordinator handles rank-0 encoding and SHM broadcast
+            try:
+                embeddings = self._mm_coordinator.get_embedding(
+                    request_id=request_id,
+                    input_ids=input_ids.squeeze(0),
+                    mm_features=mm_features_list[0],
+                )
+            except Exception as e:
+                logger.error(
+                    "[FATAL] Rank %d: get_embedding() failed for %s: %s",
+                    getattr(self, 'rank', -1), request_id, e, exc_info=True
+                )
+                raise
+
+
+            # CRITICAL: Coordinator returns embeddings on CPU (from poller thread)
+            # Must move to correct device before using in model forward pass
+            if embeddings.device != self.device:
+                logger.debug(
+                    "Moving embeddings from %s to %s for request %s",
+                    embeddings.device, self.device, request_id
+                )
+                embeddings = embeddings.to(self.device)
+        else:
+            # No coordinator (warmup or fallback) - direct call
+            assert self._model is not None
+            embeddings = self.model.get_maybe_mm_embeddings(
+                input_ids,
+                mm_features=mm_features_list,
+                is_decode=is_decode,
+            )
+
+        # Ensure embeddings have batch dimension: (batch, seq_len, hidden_dim)
+        if embeddings.ndim == 2:
+            embeddings = embeddings.unsqueeze(0)
+        elif embeddings.ndim == 3:
+            pass  # Already correct
+        else:
+            raise ValueError(
+                f"Unexpected embeddings shape: {embeddings.shape}, ndim={embeddings.ndim}"
+            )
+
+        return embeddings
 
     @abstractmethod
     def load_model(self) -> None:
@@ -1041,10 +1142,12 @@ class ChunkedPrefillModelRunner(
             ).unsqueeze(0)
 
             t0 = time.time()
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
+            # Use coordinator for de-duplication if available (ADR-001)
+            full_embeds = self.get_maybe_mm_embeddings(
+                input_ids=full_input_tokens,
                 mm_features=mm_features,
                 is_decode=False,
+                request_id=req_id,
             )
 
             t_elapsed = time.time() - t0
@@ -1531,22 +1634,31 @@ class ChunkedPrefillModelRunner(
         scheduler_output: SchedulerOutput,
         **kwargs,
     ) -> ModelRunnerOutput:
+        logger.info("[DIAGNOSTIC] execute_model START, rank=%d", getattr(self, 'rank', -1))
         t0 = time.time()
 
+        logger.info("[DIAGNOSTIC] Calling update_states, rank=%d", getattr(self, 'rank', -1))
         self.update_states(scheduler_output)
+        logger.info("[DIAGNOSTIC] update_states DONE, rank=%d", getattr(self, 'rank', -1))
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             return self.get_empty_output()
 
         # Initialize internal request states if this is the first chunk of a very new prefill
+        logger.info("[DIAGNOSTIC] Calling maybe_setup_new_prefill, rank=%d", getattr(self, 'rank', -1))
         self.maybe_setup_new_prefill(scheduler_output)
+        logger.info("[DIAGNOSTIC] maybe_setup_new_prefill DONE, rank=%d", getattr(self, 'rank', -1))
 
+        logger.info("[DIAGNOSTIC] Calling prepare_model_input, rank=%d", getattr(self, 'rank', -1))
         model_input = self.prepare_model_input(scheduler_output)
+        logger.info("[DIAGNOSTIC] prepare_model_input DONE, rank=%d", getattr(self, 'rank', -1))
         is_prefill = model_input.is_prompt
 
         # Execute the model
+        logger.info("[DIAGNOSTIC] Calling build_attn_metadata, rank=%d", getattr(self, 'rank', -1))
         attn_metadata = self.build_attn_metadata(model_input)
+        logger.info("[DIAGNOSTIC] build_attn_metadata DONE, rank=%d", getattr(self, 'rank', -1))
         # Embeddings take priority [used by multimodal models only]
         input_ids_or_embeds = (
             model_input.input_embeds
@@ -1563,11 +1675,25 @@ class ChunkedPrefillModelRunner(
                 f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
             )
 
+            # DIAGNOSTIC: Log before model forward pass to detect hangs
+            logger.info(
+                "[DIAGNOSTIC] Rank %d entering model forward pass, is_prefill=%s, batch_size=%d",
+                getattr(self, 'rank', -1), model_input.is_prompt,
+                len(scheduler_output.num_scheduled_tokens)
+            )
+            forward_start = time.time()
+
             logits = self.model(
                 input_ids_or_embeds=input_ids_or_embeds,
                 positions=model_input.input_positions,
                 masks=None,
                 is_prompt=model_input.is_prompt,
+            )
+
+            forward_elapsed = time.time() - forward_start
+            logger.info(
+                "[DIAGNOSTIC] Rank %d completed model forward pass in %.2fms",
+                getattr(self, 'rank', -1), forward_elapsed * 1000
             )
 
         # If the prompt is being prefilled we don't have to sample
