@@ -160,6 +160,11 @@ class MMCoordinator:
             if self._result_queues is None:
                 raise RuntimeError("rank-0 requires result_queues")
 
+            logger.info(
+                "MMCoordinator.start() on rank-0: _result_queues has %d queues",
+                len(self._result_queues)
+            )
+
             # Start thread pool
             # Use 32 workers: enough for concurrent encoding without excessive overhead
             self._executor = ThreadPoolExecutor(
@@ -192,7 +197,8 @@ class MMCoordinator:
         logger.info("Submission listener thread started on rank-0")
         while not self._shutdown:
             try:
-                item = self._submission_queue.get(timeout=0.1)
+                # EVENT-DRIVEN: Block until submission arrives (no polling!)
+                item = self._submission_queue.get(block=True, timeout=None)
                 if item is None:
                     # Shutdown sentinel
                     logger.info("Submission listener received shutdown sentinel")
@@ -219,8 +225,6 @@ class MMCoordinator:
                 # Submit encoding
                 self.submit_encoding(request_id, input_ids, mm_features)
 
-            except mp.queues.Empty:
-                continue
             except Exception as e:
                 if not self._shutdown:
                     logger.error("Submission listener error: %s", e, exc_info=True)
@@ -246,12 +250,20 @@ class MMCoordinator:
         """
         assert self.is_rank0, "submit_encoding must only be called on rank-0"
 
+        logger.info(
+            "submit_encoding called for %s, _result_queues has %d queues",
+            request_id,
+            len(self._result_queues) if self._result_queues else 0
+        )
+
         with self._futures_lock:
             if request_id in self._encoding_futures:
                 # Already being processed
+                logger.info("Request %s already being processed, skipping", request_id)
                 return
             if request_id in self._local_embeddings:
                 # Already completed
+                logger.info("Request %s already completed, skipping", request_id)
                 return
 
             # Create event for this request
@@ -259,6 +271,7 @@ class MMCoordinator:
                 self._local_events[request_id] = threading.Event()
 
             # Submit to thread pool
+            logger.info("Submitting %s to thread pool for encoding", request_id)
             future = self._executor.submit(
                 self._encode_and_broadcast,
                 request_id,
@@ -266,11 +279,18 @@ class MMCoordinator:
                 mm_features,
             )
             self._encoding_futures[request_id] = future
+            logger.info("Request %s submitted to thread pool", request_id)
 
     def _encode_and_broadcast(
         self, request_id: str, input_ids: torch.Tensor, mm_features: Any
     ) -> None:
         """Run encoding and broadcast result to all ranks."""
+        logger.info(
+            "_encode_and_broadcast START for %s: _result_queues=%s (len=%d if not None)",
+            request_id,
+            "None" if self._result_queues is None else "List",
+            len(self._result_queues) if self._result_queues else 0
+        )
         try:
             # Run vision encoder
             embeddings = self._encode_mm(input_ids, mm_features)
@@ -290,8 +310,21 @@ class MMCoordinator:
                 dtype=embeddings.dtype,
             )
 
-            for queue in self._result_queues:  # type: ignore
-                queue.put(result)
+            logger.info(
+                "Broadcasting result for %s to %d ranks (shm=%s)",
+                request_id, len(self._result_queues) if self._result_queues else 0, shm_name
+            )
+
+            if not self._result_queues:
+                logger.error("CRITICAL: _result_queues is empty! Cannot broadcast results!")
+                return
+
+            for i, queue in enumerate(self._result_queues):  # type: ignore
+                try:
+                    queue.put(result)
+                    logger.debug("Broadcast to rank %d successful", i)
+                except Exception as e:
+                    logger.error("Failed to broadcast to rank %d: %s", i, e, exc_info=True)
 
         except Exception as e:
             logger.error(f"MM encoding failed for {request_id}: {e}", exc_info=True)
@@ -418,23 +451,85 @@ class MMCoordinator:
 
         while not self._shutdown:
             try:
-                # Get first result with timeout (reduced for lower latency)
-                result: MMEncodingResult = self._result_queue.get(timeout=0.1)  # type: ignore
+                # EVENT-DRIVEN: Block indefinitely until result arrives (no polling!)
+                # Thread sleeps in kernel, releases GIL, zero CPU usage
+                result: MMEncodingResult = self._result_queue.get(block=True, timeout=None)  # type: ignore
+
+                # Check for shutdown sentinel
+                if result is None:
+                    logger.debug("Poller received shutdown sentinel")
+                    break
+
                 process_result(result)
 
                 # Fast-drain: process all available results immediately
                 while True:
                     try:
                         result = self._result_queue.get_nowait()  # type: ignore
+                        if result is None:  # Shutdown sentinel
+                            logger.debug("Poller received shutdown sentinel (fast-drain)")
+                            self._shutdown = True
+                            break
                         process_result(result)
                     except mp.queues.Empty:
                         break  # No more results, go back to blocking wait
 
-            except mp.queues.Empty:
-                continue
             except Exception as e:
                 if not self._shutdown:
-                    logger.error("MMCoordinator poller error: %s", e)
+                    logger.error("MMCoordinator poller error: %s", e, exc_info=True)
+
+    def get_embedding_if_ready(
+        self,
+        request_id: str,
+        input_ids: torch.Tensor,
+        mm_features: Any,
+    ) -> torch.Tensor | None:
+        """Non-blocking check for MM embedding.
+
+        Returns embedding immediately if ready, None if still encoding.
+        This allows the worker thread to continue without blocking.
+
+        Args:
+            request_id: Unique request identifier
+            input_ids: Token IDs for fallback submission
+            mm_features: MultiModal features for fallback submission
+
+        Returns:
+            Embedding tensor if ready, None if still encoding
+
+        Raises:
+            RuntimeError: If encoding failed
+        """
+        # Check if already cached
+        with self._cache_lock:
+            if request_id in self._local_embeddings:
+                return self._local_embeddings[request_id].clone()
+            if request_id in self._local_errors:
+                raise RuntimeError(self._local_errors[request_id])
+
+        # Fallback: If rank-0 and encoding not yet submitted, submit it now
+        if self.is_rank0:
+            needs_submission = False
+            with self._futures_lock:
+                if request_id not in self._encoding_futures:
+                    needs_submission = True
+
+            if needs_submission:
+                logger.info(
+                    "MM encoding for %s was not pre-submitted, submitting now (fallback)",
+                    request_id
+                )
+                self.submit_encoding(request_id, input_ids, mm_features)
+
+        # Check if ready (non-blocking)
+        with self._cache_lock:
+            if request_id in self._local_embeddings:
+                return self._local_embeddings[request_id].clone()
+            if request_id in self._local_errors:
+                raise RuntimeError(self._local_errors[request_id])
+
+        # Not ready yet
+        return None
 
     def get_embedding(
         self,
@@ -443,14 +538,10 @@ class MMCoordinator:
         mm_features: Any,
         timeout: float = 60.0,
     ) -> torch.Tensor:
-        """Request MM embedding from coordinator.
+        """Request MM embedding from coordinator (BLOCKING - use get_embedding_if_ready() instead).
 
-        Rank-0: Check encoding future directly, then fall back to poller if needed.
-        Other ranks: Wait for poller to receive result.
-
-        Encoding should already be submitted via submission listener, but
-        we have a fallback to submit it here if it wasn't (e.g., if the
-        request was queued before reaching the scheduler).
+        This method blocks until encoding completes. Prefer get_embedding_if_ready()
+        for non-blocking operation.
 
         Returns cached tensor instantly if already available.
         Raises TimeoutError if encoding doesn't complete within timeout.
@@ -579,13 +670,25 @@ class MMCoordinator:
         """Shutdown the coordinator and cleanup resources."""
         self._shutdown = True
 
+        # Send shutdown sentinel to wake up blocking poller thread
+        if self._result_queue is not None:
+            try:
+                self._result_queue.put(None)  # Wake up blocking get()
+                logger.debug("Sent shutdown sentinel to poller")
+            except Exception as e:
+                logger.warning("Failed to send shutdown sentinel: %s", e)
+
         # Wait for poller
         if self._poller_thread is not None:
             self._poller_thread.join(timeout=5.0)
+            if self._poller_thread.is_alive():
+                logger.warning("Poller thread did not exit cleanly")
 
         # Wait for submission listener
         if self._submission_listener is not None:
             self._submission_listener.join(timeout=5.0)
+            if self._submission_listener.is_alive():
+                logger.warning("Submission listener thread did not exit cleanly")
 
         # Shutdown executor
         if self._executor is not None:

@@ -20,26 +20,6 @@ else:
 
 logger = init_logger(__name__)
 
-# Global MM encoding callback - set by executor when coordinator is ready
-_mm_encoding_callback: Optional[Callable[[str, list[int], Any], None]] = None
-
-
-def set_global_mm_encoding_callback(
-    callback: Callable[[str, list[int], Any], None]
-) -> None:
-    """Set the global MM encoding callback.
-
-    This is called by the executor to inject the callback that submits
-    multimodal encoding requests at request arrival time (before prefill).
-
-    Args:
-        callback: Function(request_id, prompt_token_ids, mm_features) to submit encoding
-    """
-    global _mm_encoding_callback
-    _mm_encoding_callback = callback
-    logger.info("Global MM encoding callback set")
-
-
 class SpyreScheduler(Scheduler):
     """Base class inheriting from the V1 scheduler to support static
     and continuous batching respecting AIU Spyre constraints."""
@@ -49,68 +29,22 @@ class SpyreScheduler(Scheduler):
         super().__init__(*args, **kwargs)
         self.model_config = self.vllm_config.model_config
 
-    def _trigger_mm_encoding_callback(
-        self, request_id: str, prompt_token_ids: list[int], mm_features
-    ) -> None:
-        """Trigger MM encoding callback if set.
-
-        This is called when a multimodal request arrives (in add_request).
-        The callback puts the encoding request on submission_queue for
-        rank-0 to process asynchronously.
-        """
-        global _mm_encoding_callback
-        if _mm_encoding_callback is not None:
-            try:
-                _mm_encoding_callback(request_id, prompt_token_ids, mm_features)
-            except Exception as e:
-                logger.warning(
-                    "MM encoding callback failed for %s: %s", request_id, e, exc_info=True
-                )
-        else:
-            logger.debug("MM encoding callback not set for request: %s", request_id)
-
-    def _trigger_mm_encoding_callback(
-        self, request_id: str, prompt_token_ids: list[int], mm_features: Any
-    ) -> None:
-        """Trigger MM encoding callback if set (global)."""
-        global _mm_encoding_callback
-        if _mm_encoding_callback is not None:
-            try:
-                _mm_encoding_callback(request_id, prompt_token_ids, mm_features)
-                logger.debug(
-                    "Triggered MM encoding callback for request %s at arrival",
-                    request_id
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to trigger MM encoding callback for request %s: %s",
-                    request_id, e
-                )
-
     def add_request(self, request: Request) -> None:
-        """Add request to scheduler and trigger MM encoding if callback is set.
+        """Add request to scheduler.
 
-        This is called when a new request arrives at the scheduler (earliest possible point).
-        For multimodal requests, this triggers encoding before the request is admitted to prefill,
-        enabling pipelining: encode during previous request's prefill/decode.
+        Note: MM encoding is triggered from SpyreExecutor.execute_model() when
+        requests are scheduled, not here. This is because the scheduler runs in
+        EngineCore (separate process) where we can't access the submission queue.
         """
-        # First add to scheduler's internal queues
+        # Add to scheduler's internal queues
         super().add_request(request)
 
-        # Trigger MM encoding for multimodal requests if callback is set
-        # This happens at request arrival, BEFORE prefill, enabling pipelining
+        # Log MM request arrival for diagnostics
         mm_features = getattr(request, "mm_features", None)
         if mm_features:
-            global _mm_encoding_callback
             logger.info(
-                "MM Request arrived at scheduler: %s, callback=%s",
-                request.request_id,
-                "SET" if _mm_encoding_callback is not None else "NOT_SET"
-            )
-            self._trigger_mm_encoding_callback(
-                request.request_id,
-                request.prompt_token_ids,
-                mm_features,
+                "MM Request arrived at scheduler: %s (encoding will be triggered from executor)",
+                request.request_id
             )
 
 
@@ -285,21 +219,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             "Expecting an instance of CPSpyreModelRunnerOutput when doing chunked prefill."
         )
 
-        # DIAGNOSTIC: Log state before update
-        logger.info(
-            "[DIAGNOSTIC] update_from_output BEFORE: running=%d, ongoing_prefills=%d, finished_req_ids=%s",
-            len(self.running),
-            len(self.ongoing_prefills),
-            scheduler_output.finished_req_ids if hasattr(scheduler_output, 'finished_req_ids') else "N/A"
-        )
-        logger.info(
-            "[DIAGNOSTIC] Running request IDs: %s",
-            [req.request_id for req in self.running]
-        )
-        logger.info(
-            "[DIAGNOSTIC] Ongoing prefill IDs: %s",
-            [req.request_id for req in self.ongoing_prefills]
-        )
+        # Check if output is empty (MM encoding not ready)
+        # If empty, skip all updates and keep request in ongoing_prefills for retry
+        if not model_runner_output.req_ids:
+            # Reset previous_step_was_prefill to False so interleaving doesn't block next schedule
+            # This prevents the "two consecutive prefills forbidden" rule from triggering incorrectly
+            self.previous_step_was_prefill = False
+            # Return early - request stays in ongoing_prefills for next iteration
+            return []
 
         # Update the correct num_computed_tokens value given left-padding and
         # prefix cache hit info
@@ -334,17 +261,6 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
 
         # Call parent update
         result = super(SpyreScheduler, self).update_from_output(scheduler_output, model_runner_output)
-
-        # DIAGNOSTIC: Log state after parent update
-        logger.info(
-            "[DIAGNOSTIC] update_from_output AFTER parent: running=%d, ongoing_prefills=%d",
-            len(self.running),
-            len(self.ongoing_prefills)
-        )
-        logger.info(
-            "[DIAGNOSTIC] Running request IDs after parent: %s",
-            [req.request_id for req in self.running]
-        )
 
         # DIAGNOSTIC: Check if finished requests were actually removed
         if hasattr(scheduler_output, 'finished_req_ids') and scheduler_output.finished_req_ids:
@@ -384,23 +300,6 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         To avoid additional specialization, some requests are held back from the
         base scheduler but are restored after
         """
-        # DIAGNOSTIC: Log scheduler state at start
-        logger.info(
-            "[DIAGNOSTIC] schedule() START: running=%d, waiting=%d, ongoing_prefills=%d, max_num_running_reqs=%d",
-            len(self.running),
-            len(self.waiting),
-            len(self.ongoing_prefills),
-            self.max_num_running_reqs
-        )
-        logger.info(
-            "[DIAGNOSTIC] Running IDs: %s",
-            [req.request_id for req in self.running]
-        )
-        logger.info(
-            "[DIAGNOSTIC] Waiting IDs: %s",
-            [req.request_id for req in self.waiting]
-        )
-
         # First purge the full waiting queue into our holdback queue, preserving
         # priority, so that the base scheduler does not see them.
         holdback_queue: deque[Request] = deque()
@@ -413,32 +312,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         while self.skipped_waiting:
             holdback_queue.append(self.skipped_waiting.pop_request())
 
-        logger.info(
-            "[DIAGNOSTIC] Holdback queue size: %d, IDs: %s",
-            len(holdback_queue),
-            [req.request_id for req in holdback_queue]
-        )
-
         # Check if new requests can be scheduled for prefill
         while holdback_queue:
             can_schedule = self.can_schedule_prefill(holdback_queue[0])
             if can_schedule:
                 new_request = holdback_queue.popleft()
-
-                logger.info(
-                    "[DIAGNOSTIC] Admitting request %s (%d prompt tokens) to prefill, holding back %d requests",
-                    new_request.request_id,
-                    new_request.num_prompt_tokens,
-                    len(holdback_queue),
-                )
-
                 # Add request to the waiting queue
                 self.waiting.append(new_request)
             else:
-                logger.info(
-                    "[DIAGNOSTIC] Cannot schedule prefill for request %s - stopping admission",
-                    holdback_queue[0].request_id
-                )
                 # Otherwise, we simply stop here so that the scheduler
                 # can work with the batch we have
                 break
@@ -543,27 +424,13 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # running and waiting queues are both empty, we can start a new batch
         # which can always be scheduled
         if len(self.running) + len(self.waiting) == 0:
-            logger.info(
-                "[DIAGNOSTIC] can_schedule_prefill(%s): TRUE - empty queues",
-                request.request_id
-            )
             return True
 
         has_priority = self._has_scheduling_priority(request)
         if not has_priority:
-            logger.info(
-                "[DIAGNOSTIC] can_schedule_prefill(%s): FALSE - no scheduling priority",
-                request.request_id
-            )
             return False
 
-        satisfies = self._satisfies_constraints(request)
-        logger.info(
-            "[DIAGNOSTIC] can_schedule_prefill(%s): %s - constraints check",
-            request.request_id,
-            "TRUE" if satisfies else "FALSE"
-        )
-        return satisfies
+        return self._satisfies_constraints(request)
 
     def _satisfies_constraints(self, request: Request) -> bool:
         # Use a local variable to check the prefix cache hit length ahead of time without mutating
@@ -612,17 +479,6 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # check that there is space in the prefill batch
         max_prefill_batch_size = 1
         cond2 = num_waiting < max_prefill_batch_size
-
-        logger.info(
-            "[DIAGNOSTIC] _satisfies_first_chunk_constraints(%s): "
-            "num_running=%d, num_waiting=%d, max_num_running_reqs=%d, "
-            "cond1=%s (%d + %d < %d), cond2=%s (%d < %d), result=%s",
-            request.request_id,
-            num_running, num_waiting, self.max_num_running_reqs,
-            cond1, num_running, num_waiting, self.max_num_running_reqs,
-            cond2, num_waiting, max_prefill_batch_size,
-            cond1 and cond2
-        )
 
         return cond1 and cond2
 

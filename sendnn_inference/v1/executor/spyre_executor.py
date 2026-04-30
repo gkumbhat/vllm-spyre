@@ -75,12 +75,10 @@ class SpyreExecutor(MultiprocExecutor):
                 tp_size,
             )
 
-            # Set up the global MM encoding callback BEFORE workers are spawned
-            # This ensures the callback is available when the scheduler is created
-            # (which happens in EngineCore, before workers start)
-            logger.info("Calling _setup_mm_encoding_callback()...")
-            self._setup_mm_encoding_callback(_mm_submission_queue)
-            logger.info("_setup_mm_encoding_callback() completed")
+            # Note: We trigger MM encoding from execute_model() instead of scheduler callback
+            # because the scheduler runs in EngineCore (different process) where we can't
+            # set module-level globals. execute_model() runs in the executor process where
+            # we have direct access to the submission_queue.
         else:
             logger.info("TP size is 1, skipping MM queue creation")
 
@@ -89,55 +87,6 @@ class SpyreExecutor(MultiprocExecutor):
         logger.info("Calling super().__init__()...")
         super().__init__(vllm_config, monitor_workers)
         logger.info("super().__init__() completed - MM coordinators initialized via _post_init_executor()")
-
-    def _setup_mm_encoding_callback(self, submission_queue: mp.Queue) -> None:
-        """Set up the global MM encoding callback in the scheduler module.
-
-        This creates a callback function that closes over the submission_queue
-        and can be called from the scheduler when requests arrive.
-
-        The callback is set as a module-level variable in sendnn_inference.v1.core.scheduler
-        so it's available in any process that imports the scheduler (including EngineCore).
-        """
-        logger.info("_setup_mm_encoding_callback: Starting...")
-
-        if submission_queue is None:
-            logger.error("_setup_mm_encoding_callback: submission_queue is None!")
-            return
-
-        logger.info("_setup_mm_encoding_callback: Importing set_global_mm_encoding_callback...")
-
-        # Import here to avoid circular imports
-        try:
-            from sendnn_inference.v1.core.scheduler import set_global_mm_encoding_callback
-            logger.info("_setup_mm_encoding_callback: Import successful")
-        except Exception as e:
-            logger.error("_setup_mm_encoding_callback: Import failed: %s", e, exc_info=True)
-            raise
-
-        def enqueue_mm_encoding(request_id: str, prompt_token_ids: list[int], mm_features: Any) -> None:
-            """Submit MM encoding request to rank-0 worker.
-
-            This is called by the scheduler when multimodal requests arrive,
-            at the earliest possible point (request arrival).
-
-            Args:
-                request_id: Unique request identifier
-                prompt_token_ids: Token IDs for the prompt
-                mm_features: Multimodal features from the request
-            """
-            try:
-                # No timeout - block until queue has space
-                # The queue is unbounded (maxsize=0) so this should never block in practice
-                submission_queue.put((request_id, prompt_token_ids, mm_features))
-                logger.info("MM callback: Queued encoding submission for request: %s", request_id)
-            except Exception as e:
-                logger.error("MM callback: Failed to queue MM encoding for request %s: %s", request_id, e, exc_info=True)
-
-        # Set the global callback so the scheduler can use it when requests arrive
-        logger.info("_setup_mm_encoding_callback: Calling set_global_mm_encoding_callback...")
-        set_global_mm_encoding_callback(enqueue_mm_encoding)
-        logger.info("_setup_mm_encoding_callback: Callback set successfully")
 
     def _post_init_executor(self) -> None:
         """Called after workers are spawned and ready.
@@ -178,10 +127,33 @@ class SpyreExecutor(MultiprocExecutor):
     ) -> Any:
         """Execute model.
 
-        MM encoding is triggered in Scheduler.add_request() when requests arrive,
-        enabling pipelining. The coordinator's get_embedding() has a fallback that
-        submits encoding if it wasn't pre-submitted, so no fallback needed here.
+        Trigger MM encoding for new requests before dispatching to workers.
+        This enables pipelining: encoding starts immediately when requests
+        are scheduled, running concurrently with the forward pass.
         """
+        # Trigger MM encoding for new multimodal requests
+        if self._mm_submission_queue is not None and hasattr(scheduler_output, 'scheduled_new_reqs'):
+            for req in scheduler_output.scheduled_new_reqs:
+                mm_features = getattr(req, 'mm_features', None)
+                if mm_features:
+                    try:
+                        # Submit encoding request to rank-0 worker
+                        self._mm_submission_queue.put((
+                            req.request_id,
+                            req.prompt_token_ids,
+                            mm_features
+                        ))
+                        logger.info(
+                            "Executor: Queued MM encoding for request %s (%d tokens)",
+                            req.request_id,
+                            len(req.prompt_token_ids)
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Executor: Failed to queue MM encoding for %s: %s",
+                            req.request_id, e, exc_info=True
+                        )
+
         # Call parent execute_model which dispatches to workers
         return super().execute_model(scheduler_output, non_block)
 

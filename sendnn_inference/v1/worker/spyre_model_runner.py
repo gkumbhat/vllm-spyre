@@ -235,21 +235,29 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
             and request_id is not None
             and not request_id.startswith("warmup-")
         ):
-            # Use coordinator for de-duplication
-            # Coordinator handles rank-0 encoding and SHM broadcast
+            # Use coordinator for de-duplication (NON-BLOCKING)
+            # Returns None if encoding not ready yet
             try:
-                embeddings = self._mm_coordinator.get_embedding(
+                embeddings = self._mm_coordinator.get_embedding_if_ready(
                     request_id=request_id,
                     input_ids=input_ids.squeeze(0),
                     mm_features=mm_features_list[0],
                 )
+
+                # If not ready, return None to signal "retry later"
+                if embeddings is None:
+                    logger.debug(
+                        "MM encoding not ready for %s, will retry",
+                        request_id
+                    )
+                    return None
+
             except Exception as e:
                 logger.error(
-                    "[FATAL] Rank %d: get_embedding() failed for %s: %s",
+                    "[FATAL] Rank %d: get_embedding_if_ready() failed for %s: %s",
                     getattr(self, 'rank', -1), request_id, e, exc_info=True
                 )
                 raise
-
 
             # Coordinator returns embeddings on CPU - move to correct device
             if embeddings.device != self.device:
@@ -1137,6 +1145,7 @@ class ChunkedPrefillModelRunner(
 
             t0 = time.time()
             # Use coordinator for de-duplication if available (ADR-001)
+            # Returns None if encoding not ready yet (non-blocking)
             full_embeds = self.get_maybe_mm_embeddings(
                 input_ids=full_input_tokens,
                 mm_features=mm_features,
@@ -1144,9 +1153,18 @@ class ChunkedPrefillModelRunner(
                 request_id=req_id,
             )
 
+            # If encoding not ready, return None to signal "skip this request for now"
+            # Scheduler will retry on next iteration
+            if full_embeds is None:
+                logger.info(
+                    "MM encoding not ready for %s in chunk-0, skipping this iteration",
+                    req_id
+                )
+                return None
+
             t_elapsed = time.time() - t0
 
-            logger.info("maybe_mm_embedding processing time: %.2fms", (t_elapsed * 1000))
+            logger.info("maybe_mm_embedding processing time: %.2fms (ready)", (t_elapsed * 1000))
             self.perf_logger.log(
                 "get_mm_embeddings_time_ms",
                 t_elapsed * 1000,
@@ -1491,6 +1509,16 @@ class ChunkedPrefillModelRunner(
             # All prefills are chunked
             # Get request id from new request or cached request
             model_inputs = self._prepare_chunked_prefill(req_id)
+
+            # If None, MM encoding not ready yet - skip this request
+            # Return None to signal "not ready", caller will handle it
+            if model_inputs is None:
+                logger.info(
+                    "Skipping prefill for %s - MM encoding not ready, will retry",
+                    req_id
+                )
+                return None
+
             self._maybe_prepare_last_prefill(req_id, scheduler_output)
 
             return model_inputs
@@ -1628,31 +1656,29 @@ class ChunkedPrefillModelRunner(
         scheduler_output: SchedulerOutput,
         **kwargs,
     ) -> ModelRunnerOutput:
-        logger.info("[DIAGNOSTIC] execute_model START, rank=%d", getattr(self, 'rank', -1))
-        t0 = time.time()
+        t_execute_start = time.time()
 
-        logger.info("[DIAGNOSTIC] Calling update_states, rank=%d", getattr(self, 'rank', -1))
         self.update_states(scheduler_output)
-        logger.info("[DIAGNOSTIC] update_states DONE, rank=%d", getattr(self, 'rank', -1))
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             return self.get_empty_output()
 
         # Initialize internal request states if this is the first chunk of a very new prefill
-        logger.info("[DIAGNOSTIC] Calling maybe_setup_new_prefill, rank=%d", getattr(self, 'rank', -1))
         self.maybe_setup_new_prefill(scheduler_output)
-        logger.info("[DIAGNOSTIC] maybe_setup_new_prefill DONE, rank=%d", getattr(self, 'rank', -1))
 
-        logger.info("[DIAGNOSTIC] Calling prepare_model_input, rank=%d", getattr(self, 'rank', -1))
+        t_prep_start = time.time()
         model_input = self.prepare_model_input(scheduler_output)
-        logger.info("[DIAGNOSTIC] prepare_model_input DONE, rank=%d", getattr(self, 'rank', -1))
+        t_prep_elapsed = (time.time() - t_prep_start) * 1000
+
+        # If None, MM encoding not ready - return empty output and scheduler will retry
+        if model_input is None:
+            return self.get_empty_output()
+
         is_prefill = model_input.is_prompt
 
         # Execute the model
-        logger.info("[DIAGNOSTIC] Calling build_attn_metadata, rank=%d", getattr(self, 'rank', -1))
         attn_metadata = self.build_attn_metadata(model_input)
-        logger.info("[DIAGNOSTIC] build_attn_metadata DONE, rank=%d", getattr(self, 'rank', -1))
         # Embeddings take priority [used by multimodal models only]
         input_ids_or_embeds = (
             model_input.input_embeds
@@ -1669,13 +1695,7 @@ class ChunkedPrefillModelRunner(
                 f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
             )
 
-            # DIAGNOSTIC: Log before model forward pass to detect hangs
-            logger.info(
-                "[DIAGNOSTIC] Rank %d entering model forward pass, is_prefill=%s, batch_size=%d",
-                getattr(self, 'rank', -1), model_input.is_prompt,
-                len(scheduler_output.num_scheduled_tokens)
-            )
-            forward_start = time.time()
+            t_forward_start = time.time()
 
             logits = self.model(
                 input_ids_or_embeds=input_ids_or_embeds,
@@ -1684,11 +1704,7 @@ class ChunkedPrefillModelRunner(
                 is_prompt=model_input.is_prompt,
             )
 
-            forward_elapsed = time.time() - forward_start
-            logger.info(
-                "[DIAGNOSTIC] Rank %d completed model forward pass in %.2fms",
-                getattr(self, 'rank', -1), forward_elapsed * 1000
-            )
+            t_forward_elapsed = (time.time() - t_forward_start) * 1000
 
         # If the prompt is being prefilled we don't have to sample
         # and generate a new token.
@@ -1697,28 +1713,39 @@ class ChunkedPrefillModelRunner(
             if not self.is_driver_worker:
                 return self.get_empty_output()
 
-            t1 = time.time() - t0
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
+            t_execute_elapsed = (time.time() - t_execute_start) * 1000
+            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", t_execute_elapsed)
             return self.prefill_output()
 
         # Apply grammar bitmask for structured output requests.
+        t_grammar_start = time.time()
         self.apply_grammar_bitmask(
             scheduler_output,
             logits,
             self.prefill_batch if is_prefill else self.input_batch,
         )
+        t_grammar_elapsed = (time.time() - t_grammar_start) * 1000
 
         # Sample the next token.
+        t_sample_start = time.time()
         output: SamplerOutput | None = self.model.sample(
             logits=logits,
             sampling_metadata=self.get_sampling_metadata(is_prefill),
         )
         assert output is not None, "Expected sampler output"
+        t_sample_elapsed = (time.time() - t_sample_start) * 1000
 
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
+        t_execute_elapsed = (time.time() - t_execute_start) * 1000
+        batch_size = model_input.input_tokens.shape[0] if model_input.input_tokens is not None else 1
         step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
+
+        # ITL measurement log - only for driver worker on decode steps
+        if not is_prefill and self.is_driver_worker:
+            logger.info(
+                "[ITL] total=%.2fms (prep=%.2fms, forward=%.2fms, grammar=%.2fms, sample=%.2fms) %s[batch=%d]",
+                t_execute_elapsed, t_prep_elapsed, t_forward_elapsed,
+                t_grammar_elapsed, t_sample_elapsed, step_type, batch_size
+            )
 
         # Get the right batch, if this is the last chunk to conclude the
         # prefill, we'll generate a token and we should get from the prefill
