@@ -407,6 +407,16 @@ class SpyreWorker(WorkerBase):
         self.perf_metrics.log("load model time", load_model_total_t, model=self.model_config.model)
         logger.info("load model took %.3fs", load_model_total_t)
 
+        # Set model in MM coordinator after load (rank-0 only needs it for encoding)
+        if self.rank == 0 and hasattr(self, 'mm_coordinator') and self.mm_coordinator is not None:
+            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+                if hasattr(self.model_runner.model, 'fms_model') and hasattr(self.model_runner.model, 'mm_model_utils'):
+                    logger.info("Setting model in MM coordinator for rank-0")
+                    self.mm_coordinator.set_model_and_utils(
+                        self.model_runner.model.fms_model,
+                        self.model_runner.model.mm_model_utils
+                    )
+
         # MM coordinator initialization is handled by the executor via collective_rpc
         # after workers are spawned. This ensures queues are properly inherited.
         # See SpyreExecutor._post_init_executor() for details.

@@ -230,27 +230,33 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
 
         # Multimodal request - use coordinator for de-duplication
         # Skip coordinator for warmup requests (request_id starts with "warmup-")
-        if (
+        use_coordinator = (
             self._mm_coordinator is not None
             and request_id is not None
             and not request_id.startswith("warmup-")
-        ):
-            # Use coordinator for de-duplication (NON-BLOCKING)
-            # Returns None if encoding not ready yet
+        )
+
+        logger.info(
+            "[COORDINATOR-CHECK] req_id=%s, has_coordinator=%s, req_id_valid=%s, not_warmup=%s, use_coordinator=%s",
+            request_id[:8] if request_id else "None",
+            self._mm_coordinator is not None,
+            request_id is not None,
+            not request_id.startswith("warmup-") if request_id else False,
+            use_coordinator
+        )
+
+        if use_coordinator:
+            # Use coordinator for de-duplication with BLOCKING WAIT
+            # This blocks chunk-0 prefill (~500ms) but subsequent chunks interleave normally
+            # The encoding itself runs in a background thread, so only rank-0 does work
+            # Other ranks wait efficiently on the result
             try:
-                embeddings = self._mm_coordinator.get_embedding_if_ready(
+                embeddings = self._mm_coordinator.get_embedding(
                     request_id=request_id,
                     input_ids=input_ids.squeeze(0),
                     mm_features=mm_features_list[0],
+                    timeout=60.0
                 )
-
-                # If not ready, return None to signal "retry later"
-                if embeddings is None:
-                    logger.debug(
-                        "MM encoding not ready for %s, will retry",
-                        request_id
-                    )
-                    return None
 
             except Exception as e:
                 logger.error(
@@ -264,6 +270,7 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
                 embeddings = embeddings.to(self.device)
         else:
             # No coordinator (warmup or fallback) - direct call
+            logger.info("[FALLBACK] Using direct model call (coordinator not available)")
             assert self._model is not None
             embeddings = self.model.get_maybe_mm_embeddings(
                 input_ids,
@@ -1144,6 +1151,8 @@ class ChunkedPrefillModelRunner(
             ).unsqueeze(0)
 
             t0 = time.time()
+            logger.info("[TIMING-RUNNER] Starting get_maybe_mm_embeddings for %s", req_id[:8])
+
             # Use coordinator for de-duplication if available (ADR-001)
             # Returns None if encoding not ready yet (non-blocking)
             full_embeds = self.get_maybe_mm_embeddings(
@@ -1152,6 +1161,9 @@ class ChunkedPrefillModelRunner(
                 is_decode=False,
                 request_id=req_id,
             )
+
+            t_after_get = time.time()
+            logger.info("[TIMING-RUNNER] get_maybe_mm_embeddings returned in %.2fms", (t_after_get - t0) * 1000)
 
             # If encoding not ready, return None to signal "skip this request for now"
             # Scheduler will retry on next iteration

@@ -137,21 +137,29 @@ class SpyreExecutor(MultiprocExecutor):
                 mm_features = getattr(req, 'mm_features', None)
                 if mm_features:
                     try:
+                        # NewRequestData uses req_id, not request_id
+                        req_id = getattr(req, 'req_id', getattr(req, 'request_id', None))
+                        prompt_token_ids = getattr(req, 'prompt_token_ids', getattr(req, 'prompt', []))
+
+                        if req_id is None:
+                            logger.warning("Executor: Request has no req_id or request_id, skipping MM encoding")
+                            continue
+
                         # Submit encoding request to rank-0 worker
                         self._mm_submission_queue.put((
-                            req.request_id,
-                            req.prompt_token_ids,
+                            req_id,
+                            prompt_token_ids,
                             mm_features
                         ))
                         logger.info(
                             "Executor: Queued MM encoding for request %s (%d tokens)",
-                            req.request_id,
-                            len(req.prompt_token_ids)
+                            req_id,
+                            len(prompt_token_ids)
                         )
                     except Exception as e:
                         logger.error(
-                            "Executor: Failed to queue MM encoding for %s: %s",
-                            req.request_id, e, exc_info=True
+                            "Executor: Failed to queue MM encoding: %s",
+                            e, exc_info=True
                         )
 
         # Call parent execute_model which dispatches to workers

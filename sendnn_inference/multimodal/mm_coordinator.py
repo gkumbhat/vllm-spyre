@@ -205,6 +205,10 @@ class MMCoordinator:
                     break
 
                 request_id, prompt_token_ids, mm_features = item
+                logger.info(
+                    "Submission listener received request %s (%d tokens)",
+                    request_id[:16], len(prompt_token_ids)
+                )
 
                 # Ensure model is set (may be set lazily)
                 if self._fms_model is None:
@@ -223,7 +227,9 @@ class MMCoordinator:
                 ).unsqueeze(0)
 
                 # Submit encoding
+                logger.info("Submission listener submitting encoding for %s", request_id[:16])
                 self.submit_encoding(request_id, input_ids, mm_features)
+                logger.info("Submission listener submitted encoding for %s", request_id[:16])
 
             except Exception as e:
                 if not self._shutdown:
@@ -440,6 +446,11 @@ class MMCoordinator:
                         self._local_embeddings[request_id] = tensor
                         self._shm_registry[request_id] = shm  # Keep reference
                         self._local_events[request_id].set()
+
+                    logger.info(
+                        "[POLLER] Cached embedding for %s (shape=%s, event_set=True)",
+                        request_id[:16], tensor.shape
+                    )
                 except Exception as e:
                     logger.error("Poller failed to process result for %s: %s", request_id, e)
                     # Store error and set event so waiting threads don't hang
@@ -451,15 +462,20 @@ class MMCoordinator:
 
         while not self._shutdown:
             try:
-                # EVENT-DRIVEN: Block indefinitely until result arrives (no polling!)
-                # Thread sleeps in kernel, releases GIL, zero CPU usage
-                result: MMEncodingResult = self._result_queue.get(block=True, timeout=None)  # type: ignore
+                # Block with small timeout for responsiveness
+                # timeout=None can have latency issues with multiprocessing.Queue
+                result: MMEncodingResult = self._result_queue.get(block=True, timeout=0.001)  # type: ignore
 
                 # Check for shutdown sentinel
                 if result is None:
                     logger.debug("Poller received shutdown sentinel")
                     break
 
+                logger.info(
+                    "[POLLER] Received result for request %s (shm=%s)",
+                    result.request_id[:16] if result.request_id else "None",
+                    result.shm_name[:20] if result.shm_name else "None"
+                )
                 process_result(result)
 
                 # Fast-drain: process all available results immediately
@@ -474,6 +490,9 @@ class MMCoordinator:
                     except mp.queues.Empty:
                         break  # No more results, go back to blocking wait
 
+            except mp.queues.Empty:
+                # Timeout - no result available, continue loop
+                continue
             except Exception as e:
                 if not self._shutdown:
                     logger.error("MMCoordinator poller error: %s", e, exc_info=True)
@@ -500,33 +519,55 @@ class MMCoordinator:
         Raises:
             RuntimeError: If encoding failed
         """
-        # Check if already cached
+        import time
+        t_start = time.time()
+
+        # OPTIMIZED: Single lock acquisition to avoid contention across 4 workers
+        needs_submission = False
+
+        t_before_lock = time.time()
+        # Check if already cached (fast path - no fallback submission needed)
         with self._cache_lock:
+            t_lock_acquired = time.time()
             if request_id in self._local_embeddings:
-                return self._local_embeddings[request_id].clone()
-            if request_id in self._local_errors:
-                raise RuntimeError(self._local_errors[request_id])
-
-        # Fallback: If rank-0 and encoding not yet submitted, submit it now
-        if self.is_rank0:
-            needs_submission = False
-            with self._futures_lock:
-                if request_id not in self._encoding_futures:
-                    needs_submission = True
-
-            if needs_submission:
+                result = self._local_embeddings[request_id].clone()
+                t_clone = time.time()
+                rank_str = "rank0" if self.is_rank0 else "rank1+"
                 logger.info(
-                    "MM encoding for %s was not pre-submitted, submitting now (fallback)",
-                    request_id
+                    "[TIMING] %s get_embedding_if_ready(%s): wait_lock=%.2fms, in_lock=%.2fms, clone=%.2fms, total=%.2fms",
+                    rank_str, request_id[:8],
+                    (t_lock_acquired - t_before_lock) * 1000,
+                    (t_clone - t_lock_acquired) * 1000,
+                    (t_clone - t_lock_acquired) * 1000,
+                    (t_clone - t_start) * 1000
                 )
-                self.submit_encoding(request_id, input_ids, mm_features)
-
-        # Check if ready (non-blocking)
-        with self._cache_lock:
-            if request_id in self._local_embeddings:
-                return self._local_embeddings[request_id].clone()
+                return result
             if request_id in self._local_errors:
                 raise RuntimeError(self._local_errors[request_id])
+
+            # Not in cache yet - check if we need fallback submission (rank-0 only)
+            if self.is_rank0:
+                with self._futures_lock:
+                    if request_id not in self._encoding_futures:
+                        needs_submission = True
+
+            t_lock_released = time.time()
+            rank_str = "rank0" if self.is_rank0 else "rank1+"
+            logger.info(
+                "[TIMING] %s get_embedding_if_ready(%s): NOT READY - wait_lock=%.2fms, in_lock=%.2fms, cache_size=%d",
+                rank_str, request_id[:8],
+                (t_lock_acquired - t_before_lock) * 1000,
+                (t_lock_released - t_lock_acquired) * 1000,
+                len(self._local_embeddings)
+            )
+
+        # If submission needed, do it outside the lock to avoid holding during I/O
+        if needs_submission:
+            logger.info(
+                "MM encoding for %s was not pre-submitted, submitting now (fallback)",
+                request_id
+            )
+            self.submit_encoding(request_id, input_ids, mm_features)
 
         # Not ready yet
         return None

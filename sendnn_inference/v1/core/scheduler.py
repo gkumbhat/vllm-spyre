@@ -220,12 +220,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         )
 
         # Check if output is empty (MM encoding not ready)
-        # If empty, skip all updates and keep request in ongoing_prefills for retry
+        # NOTE: With blocking wait in model runner, this should not happen
+        # But keep the logic for safety
         if not model_runner_output.req_ids:
+            logger.warning(
+                "Empty output received - this should not happen with blocking MM encoding"
+            )
             # Reset previous_step_was_prefill to False so interleaving doesn't block next schedule
-            # This prevents the "two consecutive prefills forbidden" rule from triggering incorrectly
             self.previous_step_was_prefill = False
-            # Return early - request stays in ongoing_prefills for next iteration
             return []
 
         # Update the correct num_computed_tokens value given left-padding and
@@ -392,6 +394,14 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
         # delegate to super of SpyreScheduler: base V1 Scheduler
         outputs = super(SpyreScheduler, self).schedule()
 
+        logger.info(
+            "[SCHEDULE-DEBUG] Parent scheduler returned: num_scheduled_tokens=%s, scheduled_new_reqs=%d, scheduled_resumed_reqs=%d, scheduled_running_reqs=%d",
+            outputs.num_scheduled_tokens if hasattr(outputs, 'num_scheduled_tokens') else "N/A",
+            len(outputs.scheduled_new_reqs) if hasattr(outputs, 'scheduled_new_reqs') else 0,
+            len(outputs.scheduled_resumed_reqs) if hasattr(outputs, 'scheduled_resumed_reqs') else 0,
+            len(outputs.scheduled_running_reqs) if hasattr(outputs, 'scheduled_running_reqs') else 0
+        )
+
         # Track as ongoing prefills only the requests that were actually
         # scheduled (i.e., moved from waiting to running by the base
         # scheduler).
@@ -428,9 +438,21 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
 
         has_priority = self._has_scheduling_priority(request)
         if not has_priority:
+            logger.info(
+                "[SCHEDULE-DEBUG] can_schedule_prefill=False for %s: no priority (previous_prefill=%s, decoding_reqs=%d)",
+                request.request_id[:12],
+                self.previous_step_was_prefill,
+                len([r for r in self.running if r not in self.ongoing_prefills])
+            )
             return False
 
-        return self._satisfies_constraints(request)
+        satisfies = self._satisfies_constraints(request)
+        if not satisfies:
+            logger.info(
+                "[SCHEDULE-DEBUG] can_schedule_prefill=False for %s: constraints not satisfied",
+                request.request_id[:12]
+            )
+        return satisfies
 
     def _satisfies_constraints(self, request: Request) -> bool:
         # Use a local variable to check the prefix cache hit length ahead of time without mutating
