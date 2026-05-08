@@ -246,21 +246,26 @@ class BaseSpyreModelRunner(ABC, Generic[InputBatchT, RequestStateT, ModelInputsT
         )
 
         if use_coordinator:
-            # Use coordinator for de-duplication with BLOCKING WAIT
-            # This blocks chunk-0 prefill (~500ms) but subsequent chunks interleave normally
-            # The encoding itself runs in a background thread, so only rank-0 does work
-            # Other ranks wait efficiently on the result
+            # Use coordinator for de-duplication with BLOCKING wait
+            # Encoding was submitted proactively, so we only wait for remaining time
             try:
+                logger.debug(
+                    "[COORDINATOR] Waiting for MM embedding for %s",
+                    request_id[:8]
+                )
                 embeddings = self._mm_coordinator.get_embedding(
                     request_id=request_id,
                     input_ids=input_ids.squeeze(0),
                     mm_features=mm_features_list[0],
-                    timeout=60.0
+                )
+                logger.debug(
+                    "[COORDINATOR] Got MM embedding for %s, shape=%s",
+                    request_id[:8], embeddings.shape
                 )
 
             except Exception as e:
                 logger.error(
-                    "[FATAL] Rank %d: get_embedding_if_ready() failed for %s: %s",
+                    "[FATAL] Rank %d: get_embedding() failed for %s: %s",
                     getattr(self, 'rank', -1), request_id, e, exc_info=True
                 )
                 raise
@@ -838,6 +843,8 @@ class ChunkedPrefillModelRunner(
             vllm_config=self.vllm_config,
             rank=self.rank,
         )
+        # Note: MM coordinator model setting is handled in SpyreWorker.initialize_mm_coordinator()
+        # after the coordinator is fully initialized
 
     @property
     def vocab_size(self) -> int:
@@ -1103,7 +1110,7 @@ class ChunkedPrefillModelRunner(
             chunk_start, chunk_end
         )
 
-        logger.debug(
+        logger.info(
             "Chunked prefill of request '%s' %d:%d of %d tokens",
             req_id,
             chunk_start,
@@ -1141,20 +1148,25 @@ class ChunkedPrefillModelRunner(
         self.model.n_pads_right = self.block_size - (((request_tkv - 1) % self.block_size) + 1)
         self.model.indices = torch.ones(1, dtype=torch.bool, device="cpu")
 
+        # DEFERRED MM EMBEDDING COMPUTATION (ADR-001):
+        # Compute embeddings as late as possible to maximize overlap with background encoding.
+        # All prep work (tensors, masks, padding) is done first, then we wait for encoding.
+
         # For multimodal requests, compute embeddings once for the full sequence
         # and cache them, then slice per chunk. This ensures image features are
         # correctly aligned across all chunks.
         if mm_features and request.cached_mm_embeddings is None:
             # First chunk: compute full multimodal embeddings
+            # By deferring until here, we've done all prep work and given encoding max time
             full_input_tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=self.device
             ).unsqueeze(0)
 
             t0 = time.time()
-            logger.info("[TIMING-RUNNER] Starting get_maybe_mm_embeddings for %s", req_id[:8])
+            logger.info("[TIMING-RUNNER] Starting get_maybe_mm_embeddings for %s (DEFERRED)", req_id[:8])
 
             # Use coordinator for de-duplication if available (ADR-001)
-            # Returns None if encoding not ready yet (non-blocking)
+            # Blocking: waits for encoding to complete (encoding was submitted early)
             full_embeds = self.get_maybe_mm_embeddings(
                 input_ids=full_input_tokens,
                 mm_features=mm_features,
@@ -1164,15 +1176,6 @@ class ChunkedPrefillModelRunner(
 
             t_after_get = time.time()
             logger.info("[TIMING-RUNNER] get_maybe_mm_embeddings returned in %.2fms", (t_after_get - t0) * 1000)
-
-            # If encoding not ready, return None to signal "skip this request for now"
-            # Scheduler will retry on next iteration
-            if full_embeds is None:
-                logger.info(
-                    "MM encoding not ready for %s in chunk-0, skipping this iteration",
-                    req_id
-                )
-                return None
 
             t_elapsed = time.time() - t0
 
@@ -1189,8 +1192,8 @@ class ChunkedPrefillModelRunner(
             request.cached_mm_embeddings = full_embeds
             logger.debug("Computed and cached full multimodal embeddings for request '%s'", req_id)
 
-        # Slice the cached embeddings for this chunk
-        if request.cached_mm_embeddings is not None:
+        # Slice the cached embeddings for this chunk (if already computed)
+        if mm_features and request.cached_mm_embeddings is not None:
             # Extract the slice corresponding to this chunk
             # Add left padding to align with the chunked token positions
             full_embeds = request.cached_mm_embeddings
@@ -1208,7 +1211,7 @@ class ChunkedPrefillModelRunner(
                 full_embeds[0, chunk_start:chunk_end]
             )
 
-            logger.debug(
+            logger.info(
                 "Sliced embeddings for chunk %d of request '%s': [%d:%d] -> [%d:%d]",
                 chunk_i,
                 req_id,
@@ -1415,6 +1418,27 @@ class ChunkedPrefillModelRunner(
         prompt_len = len(prompt_token_ids)
         mm_features = getattr(request, "mm_features", None)
 
+        # ADR-001: Proactively submit MM encoding on rank-0 as early as possible
+        # This allows encoding to run in background while we process prefill chunks
+        if (
+            mm_features
+            and self._mm_coordinator is not None
+            and self.rank == 0
+            and not req_id.startswith("warmup-")
+        ):
+            full_input_tokens = torch.tensor(
+                prompt_token_ids, dtype=torch.int64, device=self.device
+            )
+            logger.info(
+                "[EARLY-SUBMIT] Rank-0 submitting MM encoding for %s at add_new_request()",
+                req_id[:8]
+            )
+            self._mm_coordinator.submit_encoding(
+                request_id=req_id,
+                input_ids=full_input_tokens,
+                mm_features=mm_features if isinstance(mm_features, list) else [mm_features],
+            )
+
         self.prefill_batch.clear_requests()
 
         # set the new tkv to the prompt length if starting a new decode batch
@@ -1521,15 +1545,6 @@ class ChunkedPrefillModelRunner(
             # All prefills are chunked
             # Get request id from new request or cached request
             model_inputs = self._prepare_chunked_prefill(req_id)
-
-            # If None, MM encoding not ready yet - skip this request
-            # Return None to signal "not ready", caller will handle it
-            if model_inputs is None:
-                logger.info(
-                    "Skipping prefill for %s - MM encoding not ready, will retry",
-                    req_id
-                )
-                return None
 
             self._maybe_prepare_last_prefill(req_id, scheduler_output)
 
@@ -1726,7 +1741,7 @@ class ChunkedPrefillModelRunner(
                 return self.get_empty_output()
 
             t_execute_elapsed = (time.time() - t_execute_start) * 1000
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", t_execute_elapsed)
+            logger.info("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", t_execute_elapsed)
             return self.prefill_output()
 
         # Apply grammar bitmask for structured output requests.

@@ -219,16 +219,6 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             "Expecting an instance of CPSpyreModelRunnerOutput when doing chunked prefill."
         )
 
-        # Check if output is empty (MM encoding not ready)
-        # NOTE: With blocking wait in model runner, this should not happen
-        # But keep the logic for safety
-        if not model_runner_output.req_ids:
-            logger.warning(
-                "Empty output received - this should not happen with blocking MM encoding"
-            )
-            # Reset previous_step_was_prefill to False so interleaving doesn't block next schedule
-            self.previous_step_was_prefill = False
-            return []
 
         # Update the correct num_computed_tokens value given left-padding and
         # prefix cache hit info

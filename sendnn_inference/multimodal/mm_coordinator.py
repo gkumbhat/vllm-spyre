@@ -31,8 +31,6 @@ from dataclasses import dataclass
 
 from vllm.logger import init_logger
 
-from sendnn_inference import envs
-
 logger = init_logger(__name__)
 
 
@@ -205,10 +203,7 @@ class MMCoordinator:
                     break
 
                 request_id, prompt_token_ids, mm_features = item
-                logger.info(
-                    "Submission listener received request %s (%d tokens)",
-                    request_id[:16], len(prompt_token_ids)
-                )
+                logger.info("Submission listener received request %s (%d tokens)", request_id[:16], len(prompt_token_ids))
 
                 # Ensure model is set (may be set lazily)
                 if self._fms_model is None:
@@ -221,15 +216,9 @@ class MMCoordinator:
                         logger.error("model_runner is None, cannot set model")
                         continue
 
-                # Create input tensor
-                input_ids = torch.tensor(
-                    prompt_token_ids, dtype=torch.int64
-                ).unsqueeze(0)
-
-                # Submit encoding
-                logger.info("Submission listener submitting encoding for %s", request_id[:16])
+                # Create input tensor and submit encoding
+                input_ids = torch.tensor(prompt_token_ids, dtype=torch.int64).unsqueeze(0)
                 self.submit_encoding(request_id, input_ids, mm_features)
-                logger.info("Submission listener submitted encoding for %s", request_id[:16])
 
             except Exception as e:
                 if not self._shutdown:
@@ -256,20 +245,12 @@ class MMCoordinator:
         """
         assert self.is_rank0, "submit_encoding must only be called on rank-0"
 
-        logger.info(
-            "submit_encoding called for %s, _result_queues has %d queues",
-            request_id,
-            len(self._result_queues) if self._result_queues else 0
-        )
-
         with self._futures_lock:
             if request_id in self._encoding_futures:
-                # Already being processed
-                logger.info("Request %s already being processed, skipping", request_id)
+                logger.debug("Request %s already being processed, skipping", request_id[:16])
                 return
             if request_id in self._local_embeddings:
-                # Already completed
-                logger.info("Request %s already completed, skipping", request_id)
+                logger.debug("Request %s already completed, skipping", request_id[:16])
                 return
 
             # Create event for this request
@@ -277,7 +258,6 @@ class MMCoordinator:
                 self._local_events[request_id] = threading.Event()
 
             # Submit to thread pool
-            logger.info("Submitting %s to thread pool for encoding", request_id)
             future = self._executor.submit(
                 self._encode_and_broadcast,
                 request_id,
@@ -285,7 +265,7 @@ class MMCoordinator:
                 mm_features,
             )
             self._encoding_futures[request_id] = future
-            logger.info("Request %s submitted to thread pool", request_id)
+            logger.info("Submitted MM encoding for request %s", request_id[:16])
 
     def _encode_and_broadcast(
         self, request_id: str, input_ids: torch.Tensor, mm_features: Any
@@ -395,14 +375,15 @@ class MMCoordinator:
             tensor = tensor.cpu()
 
         # Create shared memory
+        size = tensor.numel() * tensor.element_size()
         shm_name = f"spyre_mm_{hash(tensor.shape) % 10000000}_{time.time_ns() % 100000}"
-        shm = shared_memory.SharedMemory(
-            name=shm_name, create=True, size=tensor.numel() * tensor.element_size()
-        )
+        shm = shared_memory.SharedMemory(name=shm_name, create=True, size=size)
 
-        # Copy tensor data
+        # Single copy directly into shared memory via a numpy view over shm.buf.
+        # Avoids the intermediate tobytes() allocation + slice-assign memcpy.
         tensor_np = tensor.detach().numpy()
-        shm.buf[: tensor.numel() * tensor.element_size()] = tensor_np.tobytes()
+        shm_view = np.ndarray(tensor_np.shape, dtype=tensor_np.dtype, buffer=shm.buf)
+        shm_view[:] = tensor_np
 
         logger.debug("Created SHM %s for tensor %s", shm_name, tensor.shape)
         return shm_name, shm
@@ -422,35 +403,35 @@ class MMCoordinator:
                         self._local_events[request_id] = threading.Event()
                     self._local_errors[request_id] = RuntimeError(result.error)
                     self._local_events[request_id].set()
+                logger.error("MM encoding failed for %s: %s", request_id[:16], result.error)
             else:
                 # Read from SharedMemory
                 try:
                     shm = shared_memory.SharedMemory(name=result.shm_name)
-                    numel = 1
-                    for dim in result.shape:
-                        numel *= dim
-                    element_size = torch.tensor([], dtype=result.dtype).element_size()
-                    size = numel * element_size
 
-                    # Copy data to avoid non-writable buffer warning
-                    data = bytes(shm.buf[:size])
-                    np_array = np.frombuffer(
-                        data, dtype=torch_dtype_to_numpy(result.dtype)
-                    ).reshape(result.shape).copy()
-                    tensor = torch.from_numpy(np_array)
+                    # Single copy: build a numpy view directly over shm.buf and
+                    # clone into a heap-owned tensor that outlives the SHM segment.
+                    # Avoids the bytes(shm.buf[:size]) + np.copy() double memcpy.
+                    shm_view = np.ndarray(
+                        tuple(result.shape),
+                        dtype=torch_dtype_to_numpy(result.dtype),
+                        buffer=shm.buf,
+                    )
+                    tensor = torch.from_numpy(shm_view).clone()
 
                     # Cache locally (keep on CPU, model runner will move to device)
                     with self._cache_lock:
-                        if request_id not in self._local_events:
-                            self._local_events[request_id] = threading.Event()
+                        # Get or create event - MUST NOT replace existing event
+                        event = self._local_events.get(request_id)
+                        if event is None:
+                            event = threading.Event()
+                            self._local_events[request_id] = event
+
                         self._local_embeddings[request_id] = tensor
                         self._shm_registry[request_id] = shm  # Keep reference
-                        self._local_events[request_id].set()
+                        event.set()  # Set the SAME event that workers are waiting on
 
-                    logger.info(
-                        "[POLLER] Cached embedding for %s (shape=%s, event_set=True)",
-                        request_id[:16], tensor.shape
-                    )
+                    logger.debug("Cached embedding for %s (shape=%s)", request_id[:16], tensor.shape)
                 except Exception as e:
                     logger.error("Poller failed to process result for %s: %s", request_id, e)
                     # Store error and set event so waiting threads don't hang
@@ -468,14 +449,8 @@ class MMCoordinator:
 
                 # Check for shutdown sentinel
                 if result is None:
-                    logger.debug("Poller received shutdown sentinel")
                     break
 
-                logger.info(
-                    "[POLLER] Received result for request %s (shm=%s)",
-                    result.request_id[:16] if result.request_id else "None",
-                    result.shm_name[:20] if result.shm_name else "None"
-                )
                 process_result(result)
 
                 # Fast-drain: process all available results immediately
@@ -483,7 +458,6 @@ class MMCoordinator:
                     try:
                         result = self._result_queue.get_nowait()  # type: ignore
                         if result is None:  # Shutdown sentinel
-                            logger.debug("Poller received shutdown sentinel (fast-drain)")
                             self._shutdown = True
                             break
                         process_result(result)
@@ -496,81 +470,6 @@ class MMCoordinator:
             except Exception as e:
                 if not self._shutdown:
                     logger.error("MMCoordinator poller error: %s", e, exc_info=True)
-
-    def get_embedding_if_ready(
-        self,
-        request_id: str,
-        input_ids: torch.Tensor,
-        mm_features: Any,
-    ) -> torch.Tensor | None:
-        """Non-blocking check for MM embedding.
-
-        Returns embedding immediately if ready, None if still encoding.
-        This allows the worker thread to continue without blocking.
-
-        Args:
-            request_id: Unique request identifier
-            input_ids: Token IDs for fallback submission
-            mm_features: MultiModal features for fallback submission
-
-        Returns:
-            Embedding tensor if ready, None if still encoding
-
-        Raises:
-            RuntimeError: If encoding failed
-        """
-        import time
-        t_start = time.time()
-
-        # OPTIMIZED: Single lock acquisition to avoid contention across 4 workers
-        needs_submission = False
-
-        t_before_lock = time.time()
-        # Check if already cached (fast path - no fallback submission needed)
-        with self._cache_lock:
-            t_lock_acquired = time.time()
-            if request_id in self._local_embeddings:
-                result = self._local_embeddings[request_id].clone()
-                t_clone = time.time()
-                rank_str = "rank0" if self.is_rank0 else "rank1+"
-                logger.info(
-                    "[TIMING] %s get_embedding_if_ready(%s): wait_lock=%.2fms, in_lock=%.2fms, clone=%.2fms, total=%.2fms",
-                    rank_str, request_id[:8],
-                    (t_lock_acquired - t_before_lock) * 1000,
-                    (t_clone - t_lock_acquired) * 1000,
-                    (t_clone - t_lock_acquired) * 1000,
-                    (t_clone - t_start) * 1000
-                )
-                return result
-            if request_id in self._local_errors:
-                raise RuntimeError(self._local_errors[request_id])
-
-            # Not in cache yet - check if we need fallback submission (rank-0 only)
-            if self.is_rank0:
-                with self._futures_lock:
-                    if request_id not in self._encoding_futures:
-                        needs_submission = True
-
-            t_lock_released = time.time()
-            rank_str = "rank0" if self.is_rank0 else "rank1+"
-            logger.info(
-                "[TIMING] %s get_embedding_if_ready(%s): NOT READY - wait_lock=%.2fms, in_lock=%.2fms, cache_size=%d",
-                rank_str, request_id[:8],
-                (t_lock_acquired - t_before_lock) * 1000,
-                (t_lock_released - t_lock_acquired) * 1000,
-                len(self._local_embeddings)
-            )
-
-        # If submission needed, do it outside the lock to avoid holding during I/O
-        if needs_submission:
-            logger.info(
-                "MM encoding for %s was not pre-submitted, submitting now (fallback)",
-                request_id
-            )
-            self.submit_encoding(request_id, input_ids, mm_features)
-
-        # Not ready yet
-        return None
 
     def get_embedding(
         self,
@@ -629,9 +528,13 @@ class MMCoordinator:
                         # (either via poller or we'll read it directly)
                         with self._cache_lock:
                             if request_id in self._local_embeddings:
-                                return self._local_embeddings[request_id].clone()
+                                embedding = self._local_embeddings.pop(request_id)
+                                self._local_events.pop(request_id, None)
+                                return embedding
                             if request_id in self._local_errors:
-                                raise RuntimeError(self._local_errors[request_id])
+                                error = self._local_errors.pop(request_id)
+                                self._local_events.pop(request_id, None)
+                                raise RuntimeError(error)
 
                         # If not in cache yet, poller will process it soon
                         # Fall through to event wait below
@@ -650,9 +553,13 @@ class MMCoordinator:
             # Check if result already arrived (poller processed it before we got here)
             if request_id in self._local_embeddings:
                 logger.debug("get_embedding(%s): found in cache after future check", request_id)
-                return self._local_embeddings[request_id].clone()
+                embedding = self._local_embeddings.pop(request_id)
+                self._local_events.pop(request_id, None)  # Clean up event
+                return embedding
             if request_id in self._local_errors:
-                raise RuntimeError(self._local_errors[request_id])
+                error = self._local_errors.pop(request_id)
+                self._local_events.pop(request_id, None)  # Clean up event
+                raise RuntimeError(error)
 
             # Create event if it doesn't exist yet
             if request_id not in self._local_events:
@@ -663,9 +570,13 @@ class MMCoordinator:
             # Check again if result arrived while we were creating the event
             if request_id in self._local_embeddings:
                 logger.debug("get_embedding(%s): found in cache after event creation", request_id)
-                return self._local_embeddings[request_id].clone()
+                embedding = self._local_embeddings.pop(request_id)
+                self._local_events.pop(request_id, None)
+                return embedding
             if request_id in self._local_errors:
-                raise RuntimeError(self._local_errors[request_id])
+                error = self._local_errors.pop(request_id)
+                self._local_events.pop(request_id, None)
+                raise RuntimeError(error)
 
         # Wait for poller to set the event
         logger.debug("get_embedding(%s): waiting on event (timeout=%s)", request_id, timeout)
@@ -677,10 +588,14 @@ class MMCoordinator:
         # Check result
         with self._cache_lock:
             if request_id in self._local_errors:
-                raise RuntimeError(self._local_errors[request_id])
+                error = self._local_errors.pop(request_id)
+                self._local_events.pop(request_id, None)
+                raise RuntimeError(error)
             if request_id in self._local_embeddings:
                 logger.debug("get_embedding(%s): returning result after event wait", request_id)
-                return self._local_embeddings[request_id].clone()
+                embedding = self._local_embeddings.pop(request_id)
+                self._local_events.pop(request_id, None)
+                return embedding
 
         raise RuntimeError(f"Encoding completed but no result found for {request_id}")
 
@@ -715,7 +630,6 @@ class MMCoordinator:
         if self._result_queue is not None:
             try:
                 self._result_queue.put(None)  # Wake up blocking get()
-                logger.debug("Sent shutdown sentinel to poller")
             except Exception as e:
                 logger.warning("Failed to send shutdown sentinel: %s", e)
 
@@ -764,6 +678,5 @@ def cleanup_stale_shared_memory() -> None:
             shm = shared_memory.SharedMemory(name=os.path.basename(shm_path))
             shm.close()
             shm.unlink()
-            logger.debug("Cleaned up stale SHM: %s", shm_path)
-        except Exception as e:
-            logger.debug("Failed to cleanup stale SHM %s: %s", shm_path, e)
+        except Exception:
+            pass  # Ignore cleanup failures

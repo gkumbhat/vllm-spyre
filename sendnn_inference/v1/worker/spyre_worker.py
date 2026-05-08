@@ -407,17 +407,8 @@ class SpyreWorker(WorkerBase):
         self.perf_metrics.log("load model time", load_model_total_t, model=self.model_config.model)
         logger.info("load model took %.3fs", load_model_total_t)
 
-        # Set model in MM coordinator after load (rank-0 only needs it for encoding)
-        if self.rank == 0 and hasattr(self, 'mm_coordinator') and self.mm_coordinator is not None:
-            if hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
-                if hasattr(self.model_runner.model, 'fms_model') and hasattr(self.model_runner.model, 'mm_model_utils'):
-                    logger.info("Setting model in MM coordinator for rank-0")
-                    self.mm_coordinator.set_model_and_utils(
-                        self.model_runner.model.fms_model,
-                        self.model_runner.model.mm_model_utils
-                    )
-
-        # MM coordinator initialization is handled by the executor via collective_rpc
+        # MM coordinator initialization and model setting is handled by the executor via collective_rpc
+        # in initialize_mm_coordinator() which is called after load_model()
         # after workers are spawned. This ensures queues are properly inherited.
         # See SpyreExecutor._post_init_executor() for details.
 
@@ -504,6 +495,22 @@ class SpyreWorker(WorkerBase):
 
         # Pass coordinator to model runner
         self.model_runner.set_mm_coordinator(self.mm_coordinator)
+
+        # Set model and utils on coordinator (rank-0 only, after model is loaded)
+        if is_rank0 and hasattr(self.model_runner, 'model') and self.model_runner.model is not None:
+            logger.info(
+                "Setting FMS model and MM utils on coordinator (rank-0): has_fms_model=%s, has_mm_utils=%s",
+                hasattr(self.model_runner.model, 'fms_model'),
+                hasattr(self.model_runner.model, 'mm_model_utils')
+            )
+            if hasattr(self.model_runner.model, 'fms_model') and hasattr(self.model_runner.model, 'mm_model_utils'):
+                self.mm_coordinator.set_model_and_utils(
+                    fms_model=self.model_runner.model.fms_model,
+                    mm_model_utils=self.model_runner.model.mm_model_utils,
+                )
+                logger.info("Model and utils set on coordinator successfully")
+            else:
+                logger.warning("Model does not have fms_model or mm_model_utils attributes")
 
         logger.info("MM coordinator initialization complete on rank %d", self.rank)
 
