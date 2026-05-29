@@ -100,6 +100,23 @@ _templates:
       FLEX_HDMA_COLLSIZE: 33554432  # 32MB
     num_gpu_blocks_override: 8192
 
+  qwen3_8b_architecture: &qwen3_8b_architecture
+    model_type: qwen3
+    num_hidden_layers: 36
+    max_position_embeddings: 40960
+    hidden_size: 4096
+    vocab_size: 151936
+    num_key_value_heads: 8
+    num_attention_heads: 32
+
+  # device config for TP=4 Qwen3 8b models
+  qwen3_8b_tp4_device_config: &qwen3_8b_tp4_device_config
+    env_vars:
+      VLLM_DT_MAX_BATCH_TKV_LIMIT: 131072  # 128k
+      FLEX_HDMA_P2PSIZE: 268435456  # 256MB
+      FLEX_HDMA_COLLSIZE: 33554432  # 32MB
+    num_gpu_blocks_override: 8192
+
   qwen3_4b_architecture: &qwen3_4b_architecture
     model_type: qwen3
     num_hidden_layers: 36
@@ -259,6 +276,17 @@ models:
         max_model_len: 32768
         max_num_seqs: 32
         device_config: *ministral3_14b_device_config
+
+  # Qwen3 8B
+  Qwen/Qwen3-8B:
+    architecture: *qwen3_8b_architecture
+
+    # Continuous batching configurations
+    continuous_batching_configs:
+      - tp_size: 4
+        max_model_len: 32768
+        max_num_seqs: 32
+        device_config: *qwen3_8b_tp4_device_config
 
   # Qwen3 4B
   Qwen/Qwen3-4B:
