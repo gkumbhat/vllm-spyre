@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
 
 import torch
+import torch.distributed
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
@@ -38,6 +39,13 @@ from sendnn_inference.perf_metrics import create_perf_metric_logger
 from sendnn_inference.platform import SpyrePlatform
 from sendnn_inference.utils import exact_div
 from sendnn_inference.v1.sample.spyre_logits_processor import build_logitsprocs_for_cb
+from sendnn_inference.v1.worker.mm_shared_memory import (
+    _DTYPE_TO_IDX as _MM_EMBED_DTYPE_TO_IDX,
+    _IDX_TO_DTYPE as _MM_EMBED_IDX_TO_DTYPE,
+    cleanup_embeddings,
+    read_embeddings,
+    write_embeddings,
+)
 
 # yapf conflicts with ruff for this block
 # yapf: disable
@@ -1032,35 +1040,81 @@ class ChunkedPrefillModelRunner(
         self.model.indices = torch.ones(1, dtype=torch.bool, device="cpu")
 
         # For multimodal requests, compute embeddings once for the full sequence
-        # and cache them, then slice per chunk. This ensures image features are
-        # correctly aligned across all chunks.
+        # and cache them, then slice per chunk.  With tensor parallelism (TP>1) each
+        # worker is a separate process; we avoid running the vision encoder world_size
+        # times by having rank 0 compute and broadcast the result to all other ranks.
+
         if mm_features and request.cached_mm_embeddings is None:
-            # First chunk: compute full multimodal embeddings
             full_input_tokens = torch.tensor(
                 prompt_token_ids, dtype=torch.int64, device=self.device
             ).unsqueeze(0)
 
-            t0 = time.time()
+            if self.rank == 0:
+                t0 = time.time()
+
             full_embeds = self.model.get_maybe_mm_embeddings(
                 full_input_tokens,
-                mm_features=mm_features,
+                mm_features=mm_features if self.rank == 0 else None,
                 is_decode=False,
             )
 
-            t_elapsed = time.time() - t0
+            if self.rank == 0:
+                t_elapsed = time.time() - t0
+                logger.info("maybe_mm_embedding processing time: %.2fms", (t_elapsed * 1000))
+                self.perf_logger.log(
+                    "get_mm_embeddings_time_ms",
+                    t_elapsed * 1000,
+                    phase="prefill",
+                    has_mm_features=True,
+                    req_id=req_id,
+                )
 
-            logger.info("maybe_mm_embedding processing time: %.2fms", (t_elapsed * 1000))
-            self.perf_logger.log(
-                "get_mm_embeddings_time_ms",
-                t_elapsed * 1000,
-                phase="prefill",
-                has_mm_features=True,
-                req_id=req_id,
-            )
+            if self.parallel_config.world_size > 1:
+                # Share rank 0's MM embeddings (vision + text) with all other ranks.
+                #
+                # Two tiny 32-byte broadcasts carry shape/dtype and act as sync signals:
+                #   broadcast A — rank 0 has written to SHM, non-rank-0 can open it
+                #   broadcast B — non-rank-0 has finished reading, rank 0 can unlink
 
-            # Cache the full embeddings for subsequent chunks
+                data_shm = None
+
+                if self.rank == 0:
+                    full_embeds = full_embeds.cpu().contiguous()
+                    data_shm = write_embeddings(full_embeds, req_id)
+                    meta = torch.tensor(
+                        [
+                            full_embeds.shape[0],
+                            full_embeds.shape[1],
+                            full_embeds.shape[2],
+                            _MM_EMBED_DTYPE_TO_IDX[full_embeds.dtype],
+                        ],
+                        dtype=torch.int64,
+                    )
+                else:
+                    meta = torch.zeros(4, dtype=torch.int64)
+
+                # Broadcast A: rank 0 signals SHM is ready + shares shape/dtype.
+                # Non-rank-0 blocks here on socket recv (OS sleep) while rank 0
+                # was computing the vision encoder — no CPU starvation.
+                torch.distributed.broadcast(meta, src=0)
+
+                if self.rank != 0:
+                    shape = (int(meta[0]), int(meta[1]), int(meta[2]))
+                    dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
+                    full_embeds = read_embeddings(req_id, shape, dtype)
+
+                # Broadcast B: non-rank-0 has closed its SHM handle; rank 0 can unlink.
+                torch.distributed.broadcast(meta, src=0)
+
+                if data_shm is not None:
+                    cleanup_embeddings(data_shm)
+
             request.cached_mm_embeddings = full_embeds
-            logger.debug("Computed and cached full multimodal embeddings for request '%s'", req_id)
+            logger.debug(
+                "Cached full multimodal embeddings for request '%s' (rank %d)",
+                req_id,
+                self.rank,
+            )
 
         # Slice the cached embeddings for this chunk
         if request.cached_mm_embeddings is not None:
