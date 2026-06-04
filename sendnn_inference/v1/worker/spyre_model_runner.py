@@ -1052,11 +1052,12 @@ class ChunkedPrefillModelRunner(
             if self.rank == 0:
                 t0 = time.time()
 
-            full_embeds = self.model.get_maybe_mm_embeddings(
-                full_input_tokens,
-                mm_features=mm_features if self.rank == 0 else None,
-                is_decode=False,
-            )
+            with torch.inference_mode():
+                full_embeds = self.model.get_maybe_mm_embeddings(
+                    full_input_tokens,
+                    mm_features=mm_features if self.rank == 0 else None,
+                    is_decode=False,
+                )
 
             if self.rank == 0:
                 t_elapsed = time.time() - t0
