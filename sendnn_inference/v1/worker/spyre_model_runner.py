@@ -1,4 +1,5 @@
 import math
+import os
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -988,10 +989,14 @@ class ChunkedPrefillModelRunner(
             chunk_end = min(chunk_start + chunk_size, prompt_len)
             chunk_left_offset = 0
 
+        # Padding positions are masked by the attention masks — use empty to avoid
+        # zeroing memory that will be either overwritten or never read by the model.
         input_tokens = torch.zeros(chunk_size, dtype=torch.int64, device=self.device)
         input_tokens_np = input_tokens.numpy()
         input_positions = torch.zeros(chunk_size, dtype=torch.int64, device=self.device)
         input_positions_np = input_positions.numpy()
+        # NOTE: keeping zeros for input_tokens/positions since token ID 0 (pad) is needed
+        # for the attention mask logic; only input_embeds padding is safe to skip zeroing.
 
         # Create tensors based on slice
         input_tokens_np[chunk_left_offset : chunk_left_offset + chunk_end - chunk_start] = (
@@ -1051,13 +1056,23 @@ class ChunkedPrefillModelRunner(
 
             if self.rank == 0:
                 t0 = time.time()
-
-            with torch.inference_mode():
                 full_embeds = self.model.get_maybe_mm_embeddings(
                     full_input_tokens,
-                    mm_features=mm_features if self.rank == 0 else None,
+                    mm_features=mm_features,
                     is_decode=False,
                 )
+            else:
+                # Non-rank-0: skip prepare_inputs_for_generation entirely.
+                # The 160 MB text-embedding allocation it does is discarded
+                # immediately when the SHM read overwrites full_embeds below.
+                # We go straight to broadcast_A recv, which is a blocking
+                # socket recv (OS sleep) — rank 0 keeps full CPU while encoding.
+                #
+                # NOTE: if there is a distributed collective inside
+                # prepare_inputs_for_generation this will reintroduce the
+                # ~1158 ms GLOO stall we saw previously.  Revert this block
+                # (restore mm_features=None path) if that happens.
+                full_embeds = None  # filled by SHM read after broadcast_A
 
             if self.rank == 0:
                 t_elapsed = time.time() - t0
@@ -1079,36 +1094,33 @@ class ChunkedPrefillModelRunner(
 
                 data_shm = None
 
-                if self.rank == 0:
-                    full_embeds = full_embeds.cpu().contiguous()
-                    data_shm = write_embeddings(full_embeds, req_id)
-                    meta = torch.tensor(
-                        [
-                            full_embeds.shape[0],
-                            full_embeds.shape[1],
-                            full_embeds.shape[2],
-                            _MM_EMBED_DTYPE_TO_IDX[full_embeds.dtype],
-                        ],
-                        dtype=torch.int64,
-                    )
-                else:
-                    meta = torch.zeros(4, dtype=torch.int64)
+                try:
+                    if self.rank == 0:
+                        full_embeds = full_embeds.cpu().contiguous()
+                        data_shm = write_embeddings(full_embeds, req_id)
+                        meta = torch.tensor(
+                            [
+                                full_embeds.shape[0],
+                                full_embeds.shape[1],
+                                full_embeds.shape[2],
+                                _MM_EMBED_DTYPE_TO_IDX[full_embeds.dtype],
+                            ],
+                            dtype=torch.int64,
+                        )
+                    else:
+                        meta = torch.zeros(4, dtype=torch.int64)
 
-                # Broadcast A: rank 0 signals SHM is ready + shares shape/dtype.
-                # Non-rank-0 blocks here on socket recv (OS sleep) while rank 0
-                # was computing the vision encoder — no CPU starvation.
-                torch.distributed.broadcast(meta, src=0)
+                    torch.distributed.broadcast(meta, src=0)
 
-                if self.rank != 0:
-                    shape = (int(meta[0]), int(meta[1]), int(meta[2]))
-                    dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
-                    full_embeds = read_embeddings(req_id, shape, dtype)
+                    if self.rank != 0:
+                        shape = (int(meta[0]), int(meta[1]), int(meta[2]))
+                        dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
+                        full_embeds = read_embeddings(req_id, shape, dtype)
 
-                # Broadcast B: non-rank-0 has closed its SHM handle; rank 0 can unlink.
-                torch.distributed.broadcast(meta, src=0)
-
-                if data_shm is not None:
-                    cleanup_embeddings(data_shm)
+                    torch.distributed.broadcast(meta, src=0)
+                finally:
+                    if data_shm is not None:
+                        cleanup_embeddings(data_shm)
 
             request.cached_mm_embeddings = full_embeds
             logger.debug(
@@ -1123,8 +1135,9 @@ class ChunkedPrefillModelRunner(
             # Add left padding to align with the chunked token positions
             full_embeds = request.cached_mm_embeddings
 
-            # Create output tensor with chunk size
-            input_embeds = torch.zeros(
+            # Padded positions are masked by left_padded_prompt_mask so the model
+            # ignores them — use empty to skip the zero-fill cost (~40 MB per chunk).
+            input_embeds = torch.empty(
                 (1, chunk_size, full_embeds.shape[-1]),
                 dtype=full_embeds.dtype,
                 device=self.device,
@@ -1590,20 +1603,20 @@ class ChunkedPrefillModelRunner(
         )
 
         with set_forward_context(attn_metadata, self.vllm_config):
-            assert (
-                self.tkv * len(scheduler_output.num_scheduled_tokens)
-                <= SpyrePlatform.get_max_batch_tkv_limit()
-            ), (
-                f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
-                f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
-            )
+                assert (
+                    self.tkv * len(scheduler_output.num_scheduled_tokens)
+                    <= SpyrePlatform.get_max_batch_tkv_limit()
+                ), (
+                    f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
+                    f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+                )
 
-            logits = self.model(
-                input_ids_or_embeds=input_ids_or_embeds,
-                positions=model_input.input_positions,
-                masks=None,
-                is_prompt=model_input.is_prompt,
-            )
+                logits = self.model(
+                    input_ids_or_embeds=input_ids_or_embeds,
+                    positions=model_input.input_positions,
+                    masks=None,
+                    is_prompt=model_input.is_prompt,
+                )
 
         # If the prompt is being prefilled we don't have to sample
         # and generate a new token.

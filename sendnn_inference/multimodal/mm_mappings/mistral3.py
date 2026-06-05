@@ -72,6 +72,12 @@ class Mistral3MMUtils(MMUtilsBase):
                 # If squeezed during spec building, add it back
                 if pixel_values.ndim == 3:
                     pixel_values = pixel_values.unsqueeze(0)
+                # Image processor outputs float32; cast to match vision tower weights
+                # (SENDNN_INFERENCE_CPU_MM_DTYPE, default float16) so the aten::to
+                # conversion happens once here rather than scattered across conv layers.
+                first_param = next(fms_model.parameters(), None)
+                if first_param is not None and pixel_values.dtype != first_param.dtype:
+                    pixel_values = pixel_values.to(dtype=first_param.dtype)
                 fms_kwargs["pixel_values"] = pixel_values
 
                 if "image_sizes" in mm_spec:
