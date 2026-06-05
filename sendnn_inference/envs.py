@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     SENDNN_INFERENCE_REQUIRE_KNOWN_CONFIG: bool = False
     SENDNN_INFERENCE_MODEL_CONFIG_FILE: str | None = None
     SENDNN_INFERENCE_CPU_MM_DTYPE: torch.dtype = torch.float16
+    SENDNN_INFERENCE_PROFILE_DIR: str = ""
+    SENDNN_INFERENCE_PROFILE_STEPS: int = 50
 
 logger = init_logger(__name__)
 
@@ -151,6 +153,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SENDNN_INFERENCE_CPU_MM_DTYPE",
             _CPU_MM_DTYPE_PLATFORM_DEFAULTS.get(platform.machine(), "float16"),
         )
+    ),
+    # If set to a directory path, enables torch.profiler on each worker and
+    # writes one Chrome trace per rank when the captured steps complete.
+    # Profiling starts only after warmup so compilation noise is excluded.
+    # Open the .json files at chrome://tracing or https://ui.perfetto.dev.
+    #
+    # SENDNN_INFERENCE_PROFILE_STEPS: how many execute_model calls to capture.
+    # Rule of thumb for 4 concurrent requests with input-len L and chunk-size C:
+    #   prefill steps = 4 * ceil(L / C)   (e.g. 4 * 4 = 16 for L=16384, C=4096)
+    #   + decode steps if needed           (e.g. +128 for output-len=128)
+    # Default 50 covers all prefills for typical configs; set higher to include
+    # full decode (e.g. SENDNN_INFERENCE_PROFILE_STEPS=200).
+    "SENDNN_INFERENCE_PROFILE_DIR": lambda: os.getenv("SENDNN_INFERENCE_PROFILE_DIR", ""),
+    "SENDNN_INFERENCE_PROFILE_STEPS": lambda: int(
+        os.getenv("SENDNN_INFERENCE_PROFILE_STEPS", "50")
     ),
 }
 # --8<-- [end:env-vars-definition]

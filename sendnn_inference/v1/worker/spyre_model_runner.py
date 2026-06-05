@@ -729,6 +729,10 @@ class ChunkedPrefillModelRunner(
 
         self.prefix_cache_stats = None
 
+        # Profiler is None until complete_warmup() fires so warmup compilation
+        # noise is never captured.  Activated by SENDNN_INFERENCE_PROFILE_DIR.
+        self._profiler: torch.profiler.profile | None = None
+
         # Initialize performance metric logger for tracking embedding times
         self.perf_logger = create_perf_metric_logger(rank=rank)
 
@@ -796,6 +800,32 @@ class ChunkedPrefillModelRunner(
         # TODO: fixup the typing here. Things are getting tripped up by having all of our "model"
         # classes inherit from `nn.Module` when maybe they don't need to
         self.model.set_past_key_value_states(num_blocks=n_blocks_avail)
+
+        # Start profiler now that warmup (torch.compile + Dynamo) is complete.
+        # This ensures traces contain only real inference steps, not compilation.
+        profile_dir = envs_spyre.SENDNN_INFERENCE_PROFILE_DIR
+        if profile_dir:
+            os.makedirs(profile_dir, exist_ok=True)
+            n_steps = envs_spyre.SENDNN_INFERENCE_PROFILE_STEPS
+
+            def _on_trace_ready(p: torch.profiler.profile) -> None:
+                path = os.path.join(profile_dir, f"trace_rank{self.rank}.json")
+                p.export_chrome_trace(path)
+                logger.info("[profiler rank %d] trace → %s", self.rank, path)
+
+            self._profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=n_steps, repeat=1),
+                on_trace_ready=_on_trace_ready,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self._profiler.start()
+            logger.info(
+                "[profiler rank %d] started post-warmup — capturing %d steps → %s",
+                self.rank, n_steps, profile_dir,
+            )
 
     def _get_blocks(self, request_id: str) -> list[int]:
         return self.requests[request_id].block_ids
@@ -1056,11 +1086,12 @@ class ChunkedPrefillModelRunner(
 
             if self.rank == 0:
                 t0 = time.time()
-                full_embeds = self.model.get_maybe_mm_embeddings(
-                    full_input_tokens,
-                    mm_features=mm_features,
-                    is_decode=False,
-                )
+                with torch.profiler.record_function("vision_encoder"):
+                    full_embeds = self.model.get_maybe_mm_embeddings(
+                        full_input_tokens,
+                        mm_features=mm_features,
+                        is_decode=False,
+                    )
             else:
                 # Non-rank-0: skip prepare_inputs_for_generation entirely.
                 # The 160 MB text-embedding allocation it does is discarded
@@ -1096,8 +1127,9 @@ class ChunkedPrefillModelRunner(
 
                 try:
                     if self.rank == 0:
-                        full_embeds = full_embeds.cpu().contiguous()
-                        data_shm = write_embeddings(full_embeds, req_id)
+                        with torch.profiler.record_function("shm_write"):
+                            full_embeds = full_embeds.cpu().contiguous()
+                            data_shm = write_embeddings(full_embeds, req_id)
                         meta = torch.tensor(
                             [
                                 full_embeds.shape[0],
@@ -1110,14 +1142,17 @@ class ChunkedPrefillModelRunner(
                     else:
                         meta = torch.zeros(4, dtype=torch.int64)
 
-                    torch.distributed.broadcast(meta, src=0)
+                    with torch.profiler.record_function("broadcast_A"):
+                        torch.distributed.broadcast(meta, src=0)
 
                     if self.rank != 0:
                         shape = (int(meta[0]), int(meta[1]), int(meta[2]))
                         dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
-                        full_embeds = read_embeddings(req_id, shape, dtype)
+                        with torch.profiler.record_function("shm_read"):
+                            full_embeds = read_embeddings(req_id, shape, dtype)
 
-                    torch.distributed.broadcast(meta, src=0)
+                    with torch.profiler.record_function("broadcast_B"):
+                        torch.distributed.broadcast(meta, src=0)
                 finally:
                     if data_shm is not None:
                         cleanup_embeddings(data_shm)
@@ -1581,72 +1616,93 @@ class ChunkedPrefillModelRunner(
     ) -> ModelRunnerOutput:
         t0 = time.time()
 
-        self.update_states(scheduler_output)
+        with torch.profiler.record_function("update_states"):
+            self.update_states(scheduler_output)
 
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             return self.get_empty_output()
 
-        # Initialize internal request states if this is the first chunk of a very new prefill
-        self.maybe_setup_new_prefill(scheduler_output)
+        try:
+            with torch.profiler.record_function("setup_new_prefill"):
+                # Initialize request state for the first chunk of a new prefill
+                self.maybe_setup_new_prefill(scheduler_output)
 
-        model_input = self.prepare_model_input(scheduler_output)
-        is_prefill = model_input.is_prompt
+            with torch.profiler.record_function("prepare_model_input"):
+                model_input = self.prepare_model_input(scheduler_output)
+            is_prefill = model_input.is_prompt
 
-        # Execute the model
-        attn_metadata = self.build_attn_metadata(model_input)
-        # Embeddings take priority [used by multimodal models only]
-        input_ids_or_embeds = (
-            model_input.input_embeds
-            if model_input.input_embeds is not None
-            else model_input.input_tokens
-        )
+            # Execute the model
+            with torch.profiler.record_function("build_attn_metadata"):
+                attn_metadata = self.build_attn_metadata(model_input)
 
-        with set_forward_context(attn_metadata, self.vllm_config):
-                assert (
-                    self.tkv * len(scheduler_output.num_scheduled_tokens)
-                    <= SpyrePlatform.get_max_batch_tkv_limit()
-                ), (
-                    f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
-                    f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+            # Embeddings take priority [used by multimodal models only]
+            input_ids_or_embeds = (
+                model_input.input_embeds
+                if model_input.input_embeds is not None
+                else model_input.input_tokens
+            )
+
+            step_label = "spyre_prefill" if is_prefill else "spyre_decode"
+            t_spyre_start = time.time()
+            with torch.profiler.record_function(step_label):
+                with set_forward_context(attn_metadata, self.vllm_config):
+                    assert (
+                        self.tkv * len(scheduler_output.num_scheduled_tokens)
+                        <= SpyrePlatform.get_max_batch_tkv_limit()
+                    ), (
+                        f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
+                        f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+                    )
+
+                    logits = self.model(
+                        input_ids_or_embeds=input_ids_or_embeds,
+                        positions=model_input.input_positions,
+                        masks=None,
+                        is_prompt=model_input.is_prompt,
+                    )
+            t_spyre_end = time.time()
+            logger.debug(
+                "[rank %d] %s: spyre=%.2fms  total=%.2fms  cpu=%.2fms",
+                self.rank, step_label,
+                (t_spyre_end - t_spyre_start) * 1000,
+                (t_spyre_end - t0) * 1000,
+                ((t_spyre_end - t0) - (t_spyre_end - t_spyre_start)) * 1000,
+            )
+
+            # If the prompt is being prefilled we don't have to sample
+            # and generate a new token.
+            if is_prefill and self.check_incomplete_prefill(scheduler_output):
+                # Only return outputs from the driver worker
+                if not self.is_driver_worker:
+                    return self.get_empty_output()
+
+                t1 = time.time() - t0
+                logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
+                return self.prefill_output()
+
+            # Apply grammar bitmask for structured output requests.
+            self.apply_grammar_bitmask(
+                scheduler_output,
+                logits,
+                self.prefill_batch if is_prefill else self.input_batch,
+            )
+
+            # Sample the next token.
+            with torch.profiler.record_function("sampling"):
+                output: SamplerOutput | None = self.model.sample(
+                    logits=logits,
+                    sampling_metadata=self.get_sampling_metadata(is_prefill),
                 )
-
-                logits = self.model(
-                    input_ids_or_embeds=input_ids_or_embeds,
-                    positions=model_input.input_positions,
-                    masks=None,
-                    is_prompt=model_input.is_prompt,
-                )
-
-        # If the prompt is being prefilled we don't have to sample
-        # and generate a new token.
-        if is_prefill and self.check_incomplete_prefill(scheduler_output):
-            # Only return outputs from the driver worker
-            if not self.is_driver_worker:
-                return self.get_empty_output()
+            assert output is not None, "Expected sampler output"
 
             t1 = time.time() - t0
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
-            return self.prefill_output()
-
-        # Apply grammar bitmask for structured output requests.
-        self.apply_grammar_bitmask(
-            scheduler_output,
-            logits,
-            self.prefill_batch if is_prefill else self.input_batch,
-        )
-
-        # Sample the next token.
-        output: SamplerOutput | None = self.model.sample(
-            logits=logits,
-            sampling_metadata=self.get_sampling_metadata(is_prefill),
-        )
-        assert output is not None, "Expected sampler output"
-
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
-        step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
+            batch_size = model_input.input_tokens.shape[0]
+            step_type = "[prefill last chunk]" if is_prefill else "[decode]"
+            logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
+        finally:
+            if self._profiler is not None:
+                self._profiler.step()
 
         # Get the right batch, if this is the last chunk to conclude the
         # prefill, we'll generate a token and we should get from the prefill
