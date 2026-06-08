@@ -823,7 +823,7 @@ class ChunkedPrefillModelRunner(
             )
             self._profiler.start()
             logger.info(
-                "[profiler rank %d] started post-warmup — capturing %d steps → %s",
+                "[profiler rank %d] started post-warmup — capturing %d decode steps → %s",
                 self.rank, n_steps, profile_dir,
             )
 

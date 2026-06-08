@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     SENDNN_INFERENCE_MODEL_CONFIG_FILE: str | None = None
     SENDNN_INFERENCE_CPU_MM_DTYPE: torch.dtype = torch.float16
     SENDNN_INFERENCE_PROFILE_DIR: str = ""
-    SENDNN_INFERENCE_PROFILE_STEPS: int = 50
+    SENDNN_INFERENCE_PROFILE_STEPS: int = 200
 
 logger = init_logger(__name__)
 
@@ -159,15 +159,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Profiling starts only after warmup so compilation noise is excluded.
     # Open the .json files at chrome://tracing or https://ui.perfetto.dev.
     #
-    # SENDNN_INFERENCE_PROFILE_STEPS: how many execute_model calls to capture.
-    # Rule of thumb for 4 concurrent requests with input-len L and chunk-size C:
-    #   prefill steps = 4 * ceil(L / C)   (e.g. 4 * 4 = 16 for L=16384, C=4096)
-    #   + decode steps if needed           (e.g. +128 for output-len=128)
-    # Default 50 covers all prefills for typical configs; set higher to include
-    # full decode (e.g. SENDNN_INFERENCE_PROFILE_STEPS=200).
+    # SENDNN_INFERENCE_PROFILE_STEPS: total execute_model calls to capture
+    #   (both prefill and decode). Rule of thumb:
+    #     steps = 4 * ceil(input_len / chunk_size) + output_len + buffer
+    #   e.g. 4 requests, input=16384, chunk=4096, output=128: 16+128+56 = 200
+    #   Default 200 covers typical configs; increase for longer outputs.
     "SENDNN_INFERENCE_PROFILE_DIR": lambda: os.getenv("SENDNN_INFERENCE_PROFILE_DIR", ""),
     "SENDNN_INFERENCE_PROFILE_STEPS": lambda: int(
-        os.getenv("SENDNN_INFERENCE_PROFILE_STEPS", "50")
+        os.getenv("SENDNN_INFERENCE_PROFILE_STEPS", "200")
     ),
 }
 # --8<-- [end:env-vars-definition]
