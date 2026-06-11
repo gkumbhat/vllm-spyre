@@ -1063,15 +1063,9 @@ class ChunkedPrefillModelRunner(
                 )
             else:
                 # Non-rank-0: skip prepare_inputs_for_generation entirely.
-                # The 160 MB text-embedding allocation it does is discarded
-                # immediately when the SHM read overwrites full_embeds below.
-                # We go straight to broadcast_A recv, which is a blocking
-                # socket recv (OS sleep) — rank 0 keeps full CPU while encoding.
-                #
-                # NOTE: if there is a distributed collective inside
-                # prepare_inputs_for_generation this will reintroduce the
-                # ~1158 ms GLOO stall we saw previously.  Revert this block
-                # (restore mm_features=None path) if that happens.
+                # This is because we would anyways discard their computed
+                # embeddings anyways once rank-0 compute is finished and broadcast
+                # is done.
                 full_embeds = None  # filled by SHM read after broadcast_A
 
             if self.rank == 0:
