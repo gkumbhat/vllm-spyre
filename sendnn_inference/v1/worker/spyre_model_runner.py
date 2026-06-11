@@ -362,8 +362,6 @@ class SpyrePoolingModelRunner(
 
         if task == "classify":
             tokenizer = AutoTokenizer.from_pretrained(self.model_config.model)
-            # Assert to satisfy type checker
-            assert tokenizer is not None, "Failed to load tokenizer"
             output = tokenizer(text="foo", text_pair="bar")
             self.use_token_type_ids = "token_type_ids" in output
             if self.use_token_type_ids:
@@ -1613,20 +1611,20 @@ class ChunkedPrefillModelRunner(
         )
 
         with set_forward_context(attn_metadata, self.vllm_config):
-                assert (
-                    self.tkv * len(scheduler_output.num_scheduled_tokens)
-                    <= SpyrePlatform.get_max_batch_tkv_limit()
-                ), (
-                    f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
-                    f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
-                )
+            assert (
+                self.tkv * len(scheduler_output.num_scheduled_tokens)
+                <= SpyrePlatform.get_max_batch_tkv_limit()
+            ), (
+                f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
+                f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+            )
 
-                logits = self.model(
-                    input_ids_or_embeds=input_ids_or_embeds,
-                    positions=model_input.input_positions,
-                    masks=None,
-                    is_prompt=model_input.is_prompt,
-                )
+            logits = self.model(
+                input_ids_or_embeds=input_ids_or_embeds,
+                positions=model_input.input_positions,
+                masks=None,
+                is_prompt=model_input.is_prompt,
+            )
 
         # If the prompt is being prefilled we don't have to sample
         # and generate a new token.
