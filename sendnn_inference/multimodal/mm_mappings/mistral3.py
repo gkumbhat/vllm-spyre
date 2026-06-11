@@ -9,6 +9,7 @@ from vllm.multimodal.inputs import (
     PlaceholderRange,
 )
 
+import sendnn_inference.envs as envs_spyre
 from sendnn_inference.multimodal.mm_mappings import MMUtilsBase, MMWarmupInputs
 
 
@@ -45,6 +46,7 @@ class Mistral3MMUtils(MMUtilsBase):
         input_ids: torch.Tensor,
         mm_features: list[MultiModalFeatureSpec],
         is_decode: bool,
+        mm_device: str,
     ) -> torch.Tensor:
         """Get the text or multimodal embeddings for mistral3 using
         the (potentially compiled) FMS model.
@@ -72,12 +74,15 @@ class Mistral3MMUtils(MMUtilsBase):
                 # If squeezed during spec building, add it back
                 if pixel_values.ndim == 3:
                     pixel_values = pixel_values.unsqueeze(0)
-                # Image processor outputs float32; cast to match vision tower weights
-                # (SENDNN_INFERENCE_CPU_MM_DTYPE, default float16) so the aten::to
-                # conversion happens once here rather than scattered across conv layers.
-                first_param = next(fms_model.parameters(), None)
-                if first_param is not None and pixel_values.dtype != first_param.dtype:
-                    pixel_values = pixel_values.to(dtype=first_param.dtype)
+                # Move pixel_values onto the same device/dtype as the
+                # vision_tower params so the encoder forward can run there
+                # (NNPA / privateuse1 backend, or CPU). mm_device is the device
+                # the vision_tower weights actually ended up on. The merge with
+                # text_embeds happens later inside FMS, where the merged
+                # output ends up on text_embeds.device (CPU) automatically.
+                mm_dtype = envs_spyre.SENDNN_INFERENCE_CPU_MM_DTYPE
+                if pixel_values.device.type != mm_device or pixel_values.dtype != mm_dtype:
+                    pixel_values = pixel_values.to(device=mm_device, dtype=mm_dtype)
                 fms_kwargs["pixel_values"] = pixel_values
 
                 if "image_sizes" in mm_spec:
