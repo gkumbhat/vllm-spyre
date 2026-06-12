@@ -731,6 +731,11 @@ class ChunkedPrefillModelRunner(
         # Initialize performance metric logger for tracking embedding times
         self.perf_logger = create_perf_metric_logger(rank=rank)
 
+        # Pre-computed MM embeddings for waiting requests (keyed by request_id).
+        # Populated by pre_encode_mm_requests() before a prefill step; consumed
+        # and removed by add_new_request() when the request begins its prefill.
+        self.pending_mm_embeddings: dict[str, torch.Tensor] = {}
+
     def load_model(self) -> None:
         self._model = SpyreCausalLM(
             vllm_config=self.vllm_config,
@@ -752,6 +757,148 @@ class ChunkedPrefillModelRunner(
     def prompt_len(request: NewRequestData | Request) -> int:
         assert request.prompt_token_ids is not None, "prompt token ids are required"
         return len(request.prompt_token_ids)
+
+    def _broadcast_mm_embeddings(
+        self, full_embeds: torch.Tensor | None, req_id: str
+    ) -> torch.Tensor | None:
+        """Broadcast MM embeddings from rank 0 to all other ranks via shared memory.
+
+        Rank 0 writes embeddings to POSIX SHM and broadcasts a 4-element metadata
+        tensor (shape + dtype) as sync signal A. Non-rank-0 workers read from SHM
+        after that signal. A second broadcast acts as sync signal B so rank 0 can
+        safely unlink the SHM block.
+
+        Returns the embeddings tensor on all ranks (None-safe: returns None when
+        world_size == 1 and full_embeds is None, which should not happen in practice).
+        """
+        data_shm = None
+        try:
+            if self.rank == 0:
+                assert full_embeds is not None
+                full_embeds = full_embeds.cpu().contiguous()
+                data_shm = write_embeddings(full_embeds, req_id)
+                meta = torch.tensor(
+                    [
+                        full_embeds.shape[0],
+                        full_embeds.shape[1],
+                        full_embeds.shape[2],
+                        _MM_EMBED_DTYPE_TO_IDX[full_embeds.dtype],
+                    ],
+                    dtype=torch.int64,
+                )
+            else:
+                meta = torch.zeros(4, dtype=torch.int64)
+
+            torch.distributed.broadcast(meta, src=0)
+
+            if self.rank != 0:
+                shape = (int(meta[0]), int(meta[1]), int(meta[2]))
+                dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
+                full_embeds = read_embeddings(req_id, shape, dtype)
+
+            torch.distributed.broadcast(meta, src=0)
+        finally:
+            if data_shm is not None:
+                cleanup_embeddings(data_shm)
+
+        return full_embeds
+
+    def pre_encode_mm_requests(self, encode_requests: list) -> None:
+        """Batch-encode waiting MM requests before their Spyre prefill step.
+
+        Called at the start of execute_model when the scheduler identifies
+        waiting multimodal requests that should have their vision embeddings
+        computed in advance.  Results are cached in self.pending_mm_embeddings
+        and consumed by add_new_request() when each request begins its prefill.
+
+        The vision tower runs exactly once for all N requests combined
+        (get_mm_embeddings_batch).  With TP > 1 all N embeddings are broadcast
+        in a single round (one [N,4] metadata tensor + SHM) rather than 2
+        broadcasts per request.
+        """
+        # Filter to requests that actually need encoding this round.
+        to_encode = [
+            r
+            for r in encode_requests
+            if r.request_id not in self.pending_mm_embeddings and r.mm_features
+        ]
+        if not to_encode:
+            return
+
+        n = len(to_encode)
+
+        # Rank 0: single batched vision-encoder forward for all N requests.
+        if self.rank == 0:
+            t0 = time.time()
+            batch_input_ids = [
+                torch.tensor(r.prompt_token_ids, dtype=torch.int64, device=self.device)
+                for r in to_encode
+            ]
+            batch_mm_features = [r.mm_features for r in to_encode]
+            all_embeds: list[torch.Tensor | None] = [
+                e.cpu().contiguous()
+                for e in self.model.get_mm_embeddings_batch(batch_input_ids, batch_mm_features)
+            ]
+            t_elapsed = time.time() - t0
+            logger.info(
+                "pre_encode_mm_requests: %.2fms for %d request(s)",
+                t_elapsed * 1000,
+                n,
+            )
+            self.perf_logger.log(
+                "get_mm_embeddings_time_ms",
+                t_elapsed * 1000,
+                phase="pre_encode",
+                has_mm_features=True,
+                req_id=",".join(r.request_id for r in to_encode),
+            )
+        else:
+            all_embeds = [None] * n
+
+        if self.parallel_config.world_size > 1:
+            # Single metadata broadcast: shape [N, 4], each row is
+            # [dim0, dim1, dim2, dtype_idx] for one embedding.
+            # Two broadcasts serve as sync A (SHM ready) and sync B (SHM safe to unlink).
+            shm_handles = []
+            try:
+                if self.rank == 0:
+                    meta = torch.zeros(n, 4, dtype=torch.int64)
+                    for i, (enc_req, embeds) in enumerate(zip(to_encode, all_embeds)):
+                        assert embeds is not None
+                        shm_handles.append(write_embeddings(embeds, enc_req.request_id))
+                        meta[i] = torch.tensor(
+                            [
+                                embeds.shape[0],
+                                embeds.shape[1],
+                                embeds.shape[2],
+                                _MM_EMBED_DTYPE_TO_IDX[embeds.dtype],
+                            ],
+                            dtype=torch.int64,
+                        )
+                else:
+                    meta = torch.zeros(n, 4, dtype=torch.int64)
+
+                torch.distributed.broadcast(meta, src=0)  # sync A
+
+                if self.rank != 0:
+                    for i, enc_req in enumerate(to_encode):
+                        shape = (int(meta[i, 0]), int(meta[i, 1]), int(meta[i, 2]))
+                        dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[i, 3])]
+                        all_embeds[i] = read_embeddings(enc_req.request_id, shape, dtype)
+
+                torch.distributed.broadcast(meta, src=0)  # sync B
+            finally:
+                for shm in shm_handles:
+                    cleanup_embeddings(shm)
+
+        for enc_req, embeds in zip(to_encode, all_embeds):
+            if embeds is not None:
+                self.pending_mm_embeddings[enc_req.request_id] = embeds
+                logger.debug(
+                    "Pre-encoded MM embeddings for waiting request '%s' (rank %d)",
+                    enc_req.request_id,
+                    self.rank,
+                )
 
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         tasks = list[SupportedTask]()
@@ -1079,41 +1226,7 @@ class ChunkedPrefillModelRunner(
                 )
 
             if self.parallel_config.world_size > 1:
-                # Share rank 0's MM embeddings (vision + text) with all other ranks.
-                #
-                # Two tiny 32-byte broadcasts carry shape/dtype and act as sync signals:
-                #   broadcast A — rank 0 has written to SHM, non-rank-0 can open it
-                #   broadcast B — non-rank-0 has finished reading, rank 0 can unlink
-
-                data_shm = None
-
-                try:
-                    if self.rank == 0:
-                        full_embeds = full_embeds.cpu().contiguous()
-                        data_shm = write_embeddings(full_embeds, req_id)
-                        meta = torch.tensor(
-                            [
-                                full_embeds.shape[0],
-                                full_embeds.shape[1],
-                                full_embeds.shape[2],
-                                _MM_EMBED_DTYPE_TO_IDX[full_embeds.dtype],
-                            ],
-                            dtype=torch.int64,
-                        )
-                    else:
-                        meta = torch.zeros(4, dtype=torch.int64)
-
-                    torch.distributed.broadcast(meta, src=0)
-
-                    if self.rank != 0:
-                        shape = (int(meta[0]), int(meta[1]), int(meta[2]))
-                        dtype = _MM_EMBED_IDX_TO_DTYPE[int(meta[3])]
-                        full_embeds = read_embeddings(req_id, shape, dtype)
-
-                    torch.distributed.broadcast(meta, src=0)
-                finally:
-                    if data_shm is not None:
-                        cleanup_embeddings(data_shm)
+                full_embeds = self._broadcast_mm_embeddings(full_embeds, req_id)
 
             request.cached_mm_embeddings = full_embeds
             logger.debug(
@@ -1384,6 +1497,17 @@ class ChunkedPrefillModelRunner(
 
         self.requests[req_id] = req_state
 
+        # Consume pre-computed embeddings if they were encoded in advance by
+        # pre_encode_mm_requests().  With cached_mm_embeddings already set,
+        # _prepare_chunked_prefill skips its encoding block entirely.
+        if req_id in self.pending_mm_embeddings:
+            req_state.cached_mm_embeddings = self.pending_mm_embeddings.pop(req_id)
+            logger.debug(
+                "Consumed pre-encoded MM embeddings for request '%s' (rank %d)",
+                req_id,
+                self.rank,
+            )
+
         # Add only to prefill batch, it will be added later to the input batch
         # once if is fully prefilled
         self.prefill_batch.add_request(req_state)
@@ -1523,6 +1647,8 @@ class ChunkedPrefillModelRunner(
         if scheduler_output.finished_req_ids:
             for req_id in scheduler_output.finished_req_ids:
                 self.input_batch.remove_request(req_id)
+                # Discard any pending pre-encoded embeddings for aborted requests
+                self.pending_mm_embeddings.pop(req_id, None)
                 # TODO: Processing multiple removals at once can break alignment
                 # of logitprocs. Refactor so that we can batch removals to the
                 # `input_batch`
@@ -1587,6 +1713,12 @@ class ChunkedPrefillModelRunner(
         if not scheduler_output.total_num_scheduled_tokens:
             # Return empty ModelRunnerOutput if there's no work to do.
             return self.get_empty_output()
+
+        # Batch-encode vision embeddings for waiting MM requests before their
+        # Spyre prefill begins.  Only present on first-chunk prefill steps.
+        mm_encode_reqs = getattr(scheduler_output, "_spyre_mm_encode_requests", [])
+        if mm_encode_reqs:
+            self.pre_encode_mm_requests(mm_encode_reqs)
 
         # Initialize internal request states if this is the first chunk of a very new prefill
         self.maybe_setup_new_prefill(scheduler_output)

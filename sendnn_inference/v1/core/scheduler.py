@@ -2,6 +2,7 @@
 
 import math
 from collections import deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Iterable, Union
 
 from vllm.logger import init_logger
@@ -19,6 +20,17 @@ else:
     SchedulerOutput = None
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class MMEncodeRequest:
+    """Lightweight descriptor for a waiting MM request that should be
+    pre-encoded before its Spyre prefill step begins."""
+
+    request_id: str
+    prompt_token_ids: list[int]
+    mm_features: list = field(default_factory=list)
+
 
 # Ensure that block_size is 64
 # This ensures the rounding function is correct
@@ -356,6 +368,27 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             self.previous_step_was_prefill = False
             running_holdback = []
 
+        # Collect MM encode requests for waiting multimodal requests before their
+        # Spyre prefill starts, so the model runner can batch-encode them in advance.
+        # Only done when a brand-new prefill is starting (new_prefill_candidates non-empty).
+        mm_encode_requests: list[MMEncodeRequest] = []
+        if new_prefill_candidates:
+            prefill_ids = {r.request_id for r in new_prefill_candidates}
+            for req in holdback_queue:
+                if req.request_id in prefill_ids:
+                    continue
+                if getattr(req, "mm_features", None):
+                    mm_encode_requests.append(
+                        MMEncodeRequest(
+                            request_id=req.request_id,
+                            prompt_token_ids=list(req.prompt_token_ids),
+                            mm_features=req.mm_features,
+                        )
+                    )
+                    prefill_ids.add(req.request_id)
+                    if len(mm_encode_requests) >= self.max_num_running_reqs - 1:
+                        break
+
         # delegate to super of SpyreScheduler: base V1 Scheduler
         outputs = super(SpyreScheduler, self).schedule()
 
@@ -376,6 +409,8 @@ class ChunkedPrefillSpyreScheduler(SpyreScheduler):
             r.num_computed_tokens <= r.num_prompt_tokens + 1 for r in self.running
         ):
             logger.debug("Scheduled tokens in this step: %s", outputs.num_scheduled_tokens)
+
+        outputs._spyre_mm_encode_requests = mm_encode_requests  # type: ignore[attr-defined]
 
         # Collect grammar bitmask synchronously for structured outputs.
         # NOTE: This is done here because vllm-spyre currently combines token sampling

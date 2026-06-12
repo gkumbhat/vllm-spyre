@@ -5,6 +5,7 @@ them here; non-zero ranks read after synchronisation in the model runner.
 This avoids running the (CPU-bound) vision encoder world_size times per request.
 """
 
+import hashlib
 from multiprocessing.shared_memory import SharedMemory
 
 import torch
@@ -28,10 +29,14 @@ def _shm_name(req_id: str) -> str:
 
     Linux NAME_MAX is 255; the shortest common constraint (macOS) is 31 chars
     for the full '/name' string, leaving 29 for the name itself.  We use
-    'sm' + 20 hex chars + 1-char suffix = 23 chars, which is safe everywhere.
+    'sm' + 20 hex chars = 22 chars, which is safe everywhere.
+
+    We hash the full req_id rather than truncating it so that requests sharing
+    a common prefix (e.g. 'chatcmpl-bench-...') produce distinct names when
+    multiple are batch-encoded simultaneously.
     """
-    safe_id = req_id.replace("-", "")[:20]
-    return f"sm{safe_id}"
+    digest = hashlib.sha1(req_id.encode(), usedforsecurity=False).hexdigest()[:20]
+    return f"sm{digest}"
 
 
 def write_embeddings(tensor: torch.Tensor, req_id: str) -> SharedMemory:
