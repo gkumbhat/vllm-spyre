@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar, Union
 
 import torch
 import torch.distributed
+from torch.profiler import record_function
 from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
@@ -767,6 +768,8 @@ class ChunkedPrefillModelRunner(
         # Initialize performance metric logger for tracking embedding times
         self.perf_logger = create_perf_metric_logger(rank=rank)
 
+        self._profiler: torch.profiler.profile | None = None
+
     def load_model(self) -> None:
         self._model = SpyreCausalLM(
             vllm_config=self.vllm_config,
@@ -831,6 +834,23 @@ class ChunkedPrefillModelRunner(
         # TODO: fixup the typing here. Things are getting tripped up by having all of our "model"
         # classes inherit from `nn.Module` when maybe they don't need to
         self.model.set_past_key_value_states(num_blocks=n_blocks_avail)
+
+        if envs_spyre.SENDNN_INFERENCE_PROFILE_DIR:
+            n_steps = envs_spyre.SENDNN_INFERENCE_PROFILE_STEPS
+            logger.info(
+                "[rank %d] Profiling enabled — capturing %d decode steps → %s",
+                self.rank,
+                n_steps,
+                envs_spyre.SENDNN_INFERENCE_PROFILE_DIR,
+            )
+            self._profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU],
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=n_steps, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                    envs_spyre.SENDNN_INFERENCE_PROFILE_DIR
+                ),
+            )
+            self._profiler.start()
 
     def _get_blocks(self, request_id: str) -> list[int]:
         return self.requests[request_id].block_ids
@@ -942,11 +962,12 @@ class ChunkedPrefillModelRunner(
                     # here still reaches the finally → broadcast A → unblocks
                     # the other ranks that are waiting on broadcast A.
                     t0 = time.time()
-                    full_embeds = self.model.get_maybe_mm_embeddings(
-                        full_input_tokens,
-                        mm_features=mm_features,
-                        is_decode=False,
-                    )
+                    with record_function("vision_encoder"):
+                        full_embeds = self.model.get_maybe_mm_embeddings(
+                            full_input_tokens,
+                            mm_features=mm_features,
+                            is_decode=False,
+                        )
                     t_elapsed = time.time() - t0
                     logger.info("maybe_mm_embedding processing time: %.2fms", (t_elapsed * 1000))
                     self.perf_logger.log(
@@ -957,7 +978,8 @@ class ChunkedPrefillModelRunner(
                         req_id=req_id,
                     )
                     full_embeds = full_embeds.cpu().contiguous()
-                    data_shm = write_embeddings(full_embeds, req_id)
+                    with record_function("shm_write"):
+                        data_shm = write_embeddings(full_embeds, req_id)
                     # Only set meta to a non-zero value on success; zeros = failure.
                     meta = torch.tensor(
                         [
@@ -973,7 +995,8 @@ class ChunkedPrefillModelRunner(
                 # ── Broadcast A (always) ──────────────────────────────────────
                 # Carries valid shape/dtype on success, all-zeros on failure.
                 # Must be in finally so it is sent even when rank 0 raises above.
-                torch.distributed.broadcast(meta, src=0)
+                with record_function("broadcast_A"):
+                    torch.distributed.broadcast(meta, src=0)
 
                 # Non-rank-0 reads from SHM only if meta signals success.
                 # Wrapped in try/except so a read failure does not stop
@@ -983,7 +1006,8 @@ class ChunkedPrefillModelRunner(
                         if meta.any():
                             shape = (int(meta[0]), int(meta[1]), int(meta[2]))
                             dtype = idx_to_dtype(int(meta[3]))
-                            full_embeds = read_embeddings(req_id, shape, dtype)
+                            with record_function("shm_read"):
+                                full_embeds = read_embeddings(req_id, shape, dtype)
                         # else: full_embeds stays None — rank 0 failed; the
                         # exception will propagate from rank 0 separately.
                     except Exception as exc:
@@ -998,7 +1022,8 @@ class ChunkedPrefillModelRunner(
                 # ── Broadcast B (always) ──────────────────────────────────────
                 # Symmetric cleanup barrier. Must be in finally for the same
                 # reason as broadcast A.
-                torch.distributed.broadcast(meta, src=0)
+                with record_function("broadcast_B"):
+                    torch.distributed.broadcast(meta, src=0)
                 if data_shm is not None:
                     cleanup_embeddings(data_shm)
         else:
@@ -1687,97 +1712,110 @@ class ChunkedPrefillModelRunner(
     ) -> ModelRunnerOutput:
         t0 = time.time()
 
-        self.update_states(scheduler_output)
+        try:
+            with record_function("update_states"):
+                self.update_states(scheduler_output)
 
-        if not scheduler_output.total_num_scheduled_tokens:
-            # Return empty ModelRunnerOutput if there's no work to do.
-            return self.get_empty_output()
+            if not scheduler_output.total_num_scheduled_tokens:
+                # Return empty ModelRunnerOutput if there's no work to do.
+                return self.get_empty_output()
 
-        # Initialize internal request states if this is the first chunk of a very new prefill
-        self.maybe_setup_new_prefill(scheduler_output)
+            # Initialize internal request states if this is the first chunk of a very new prefill
+            with record_function("setup_new_prefill"):
+                self.maybe_setup_new_prefill(scheduler_output)
 
-        model_input = self.prepare_model_input(scheduler_output)
-        is_prefill = model_input.is_prompt
+            with record_function("prepare_model_input"):
+                model_input = self.prepare_model_input(scheduler_output)
+            is_prefill = model_input.is_prompt
 
-        # Execute the model
-        attn_metadata = self.build_attn_metadata(model_input)
-        # Embeddings take priority [used by multimodal models only]
-        input_ids_or_embeds = (
-            model_input.input_embeds
-            if model_input.input_embeds is not None
-            else model_input.input_tokens
-        )
-
-        with set_forward_context(attn_metadata, self.vllm_config):
-            assert (
-                self.tkv * len(scheduler_output.num_scheduled_tokens)
-                <= SpyrePlatform.get_max_batch_tkv_limit()
-            ), (
-                f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
-                f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+            # Execute the model
+            with record_function("build_attn_metadata"):
+                attn_metadata = self.build_attn_metadata(model_input)
+            # Embeddings take priority [used by multimodal models only]
+            input_ids_or_embeds = (
+                model_input.input_embeds
+                if model_input.input_embeds is not None
+                else model_input.input_tokens
             )
 
-            logits = self.model(
-                input_ids_or_embeds=input_ids_or_embeds,
-                positions=model_input.input_positions,
-                masks=None,
-                is_prompt=model_input.is_prompt,
+            forward_label = "spyre_prefill" if is_prefill else "spyre_decode"
+            with set_forward_context(attn_metadata, self.vllm_config):
+                assert (
+                    self.tkv * len(scheduler_output.num_scheduled_tokens)
+                    <= SpyrePlatform.get_max_batch_tkv_limit()
+                ), (
+                    f"Exceeded max batch tkv limit {SpyrePlatform.get_max_batch_tkv_limit()}!"
+                    f" tkv: {self.tkv}, batch_size: {len(scheduler_output.num_scheduled_tokens)}"
+                )
+
+                with record_function(forward_label):
+                    logits = self.model(
+                        input_ids_or_embeds=input_ids_or_embeds,
+                        positions=model_input.input_positions,
+                        masks=None,
+                        is_prompt=model_input.is_prompt,
+                    )
+
+            # If the prompt is being prefilled we don't have to sample
+            # and generate a new token.
+            if is_prefill and self.check_incomplete_prefill(scheduler_output):
+                # Only return outputs from the driver worker
+                if not self.is_driver_worker:
+                    return self.get_empty_output()
+
+                t1 = time.time() - t0
+                logger.debug(
+                    "t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000)
+                )
+                return self.prefill_output()
+
+            # Apply grammar bitmask for structured output requests.
+            self.apply_grammar_bitmask(
+                scheduler_output,
+                logits,
+                self.prefill_batch if is_prefill else self.input_batch,
             )
 
-        # If the prompt is being prefilled we don't have to sample
-        # and generate a new token.
-        if is_prefill and self.check_incomplete_prefill(scheduler_output):
+            # Sample the next token.
+            with record_function("sampling"):
+                output: SamplerOutput | None = self.model.sample(
+                    logits=logits,
+                    sampling_metadata=self.get_sampling_metadata(is_prefill),
+                )
+            assert output is not None, "Expected sampler output"
+
+            t1 = time.time() - t0
+            batch_size = model_input.input_tokens.shape[0]
+            step_type = "[prefill last chunk]" if is_prefill else "[decode]"
+            logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
+
+            # Get the right batch, if this is the last chunk to conclude the
+            # prefill, we'll generate a token and we should get from the prefill
+            # batch because input_batch may have other request that are were
+            # not processed at this step.
+            batch = self.prefill_batch if is_prefill else self.input_batch
+
+            # Add the sampled token(s) to the request cache
+            req_ids = (
+                [r.req_id for r in scheduler_output.scheduled_new_reqs]
+                if len(scheduler_output.scheduled_new_reqs) > 0
+                else batch.sorted_requests_ids
+            )
+            sampled_ids = output.sampled_token_ids.tolist()
+
+            for i, req_id in enumerate(req_ids):
+                req_state = self.requests[req_id]
+                req_state.append_output_token_ids(sampled_ids[i])
+
             # Only return outputs from the driver worker
             if not self.is_driver_worker:
                 return self.get_empty_output()
 
-            t1 = time.time() - t0
-            logger.debug("t_forward_pass: %.2fms [prefill single chunk][batch size 1]", (t1 * 1000))
-            return self.prefill_output()
-
-        # Apply grammar bitmask for structured output requests.
-        self.apply_grammar_bitmask(
-            scheduler_output,
-            logits,
-            self.prefill_batch if is_prefill else self.input_batch,
-        )
-
-        # Sample the next token.
-        output: SamplerOutput | None = self.model.sample(
-            logits=logits,
-            sampling_metadata=self.get_sampling_metadata(is_prefill),
-        )
-        assert output is not None, "Expected sampler output"
-
-        t1 = time.time() - t0
-        batch_size = model_input.input_tokens.shape[0]
-        step_type = "[prefill last chunk]" if is_prefill else "[decode]"
-        logger.debug("t_token: %.2fms %s[batch size %d]", (t1 * 1000), step_type, batch_size)
-
-        # Get the right batch, if this is the last chunk to conclude the
-        # prefill, we'll generate a token and we should get from the prefill
-        # batch because input_batch may have other request that are were
-        # not processed at this step.
-        batch = self.prefill_batch if is_prefill else self.input_batch
-
-        # Add the sampled token(s) to the request cache
-        req_ids = (
-            [r.req_id for r in scheduler_output.scheduled_new_reqs]
-            if len(scheduler_output.scheduled_new_reqs) > 0
-            else batch.sorted_requests_ids
-        )
-        sampled_ids = output.sampled_token_ids.tolist()
-
-        for i, req_id in enumerate(req_ids):
-            req_state = self.requests[req_id]
-            req_state.append_output_token_ids(sampled_ids[i])
-
-        # Only return outputs from the driver worker
-        if not self.is_driver_worker:
-            return self.get_empty_output()
-
-        model_output = self.sampled_output(output, is_prefill)
-        return model_output
+            model_output = self.sampled_output(output, is_prefill)
+            return model_output
+        finally:
+            if self._profiler is not None:
+                self._profiler.step()
 
     def prefill_output(self) -> SpyreModelRunnerOutput:
         req_id_to_index = self.get_req_id_to_index(is_prefill=True)

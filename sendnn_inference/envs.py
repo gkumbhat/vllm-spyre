@@ -27,6 +27,8 @@ if TYPE_CHECKING:
     SENDNN_INFERENCE_CPU_MM_DTYPE: torch.dtype = torch.float16
     SENDNN_INFERENCE_MM_DEVICE: str = "auto"
     SENDNN_INFERENCE_TP_MM_SHARING: bool = True
+    SENDNN_INFERENCE_PROFILE_DIR: str | None = None
+    SENDNN_INFERENCE_PROFILE_STEPS: int = 200
 
 logger = init_logger(__name__)
 
@@ -179,6 +181,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # SHM-related failure modes at the cost of redundant CPU work.
     "SENDNN_INFERENCE_TP_MM_SHARING": lambda: bool(
         int(os.getenv("SENDNN_INFERENCE_TP_MM_SHARING", "1"))
+    ),
+    # If set, enables torch.profiler on each worker after warmup.
+    # Traces are written to this directory and can be viewed at
+    # chrome://tracing or perfetto.dev.  Profiling starts only after
+    # warmup so compilation noise is excluded.
+    "SENDNN_INFERENCE_PROFILE_DIR": lambda: os.getenv("SENDNN_INFERENCE_PROFILE_DIR"),
+    # Number of execute_model calls to capture.
+    # steps = 4 * ceil(input_len / chunk_size) + output_len + buffer
+    # Example: 4 * ceil(512/512) + 150 + 46 ≈ 200 steps.
+    "SENDNN_INFERENCE_PROFILE_STEPS": lambda: int(
+        os.getenv("SENDNN_INFERENCE_PROFILE_STEPS", "200")
     ),
 }
 # --8<-- [end:env-vars-definition]
