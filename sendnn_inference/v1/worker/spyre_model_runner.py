@@ -847,7 +847,8 @@ class ChunkedPrefillModelRunner(
                 activities=[torch.profiler.ProfilerActivity.CPU],
                 schedule=torch.profiler.schedule(wait=0, warmup=0, active=n_steps, repeat=1),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    envs_spyre.SENDNN_INFERENCE_PROFILE_DIR
+                    envs_spyre.SENDNN_INFERENCE_PROFILE_DIR,
+                    worker_name=f"rank{self.rank}",
                 ),
             )
             self._profiler.start()
